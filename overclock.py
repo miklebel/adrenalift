@@ -498,6 +498,10 @@ Examples:
         resp, _ = smu.send_msg(PPSMC.SetSoftMaxByFreq, param)
         print(f"  SetSoftMax({effective_max}): resp={resp}")
 
+        # Set hard max to match -- SMU clamps soft max to never exceed hard max
+        resp_hm, _ = smu.send_msg(PPSMC.SetHardMaxByFreq, param)
+        print(f"  SetHardMax({effective_max}): resp={resp_hm}")
+
         # Also try pushing soft MIN higher to encourage boost
         param_min = ((PPCLK.GFXCLK & 0xFFFF) << 16) | (args.clock & 0xFFFF)
         resp2, _ = smu.send_msg(PPSMC.SetSoftMinByFreq, param_min)
@@ -573,6 +577,7 @@ Examples:
             effective_max = args.clock + args.offset
             param = ((PPCLK.GFXCLK & 0xFFFF) << 16) | (effective_max & 0xFFFF)
             smu.send_msg(PPSMC.SetSoftMaxByFreq, param)
+            smu.send_msg(PPSMC.SetHardMaxByFreq, param)
             param_min = ((PPCLK.GFXCLK & 0xFFFF) << 16) | (args.clock & 0xFFFF)
             smu.send_msg(PPSMC.SetSoftMinByFreq, param_min)
             smu.send_msg(PPSMC.SetPptLimit, args.power)
