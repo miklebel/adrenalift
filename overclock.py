@@ -552,10 +552,13 @@ Examples:
         resp_hm, _ = smu.send_msg(PPSMC.SetHardMaxByFreq, param)
         print(f"  SetHardMax({effective_max}): resp={resp_hm}")
 
-        # Also try pushing soft MIN higher to encourage boost
+        # Also try pushing soft/hard MIN higher to encourage boost
         param_min = ((PPCLK.GFXCLK & 0xFFFF) << 16) | (args.clock & 0xFFFF)
         resp2, _ = smu.send_msg(PPSMC.SetSoftMinByFreq, param_min)
         print(f"  SetSoftMin({args.clock}): resp={resp2}")
+
+        resp_hmin, _ = smu.send_msg(PPSMC.SetHardMinByFreq, param_min)
+        print(f"  SetHardMin({args.clock}): resp={resp_hmin}")
 
         # Try direct SetPptLimit now that kernel cache has higher MsgLimits.Power
         # (Linux patch-8 enables this by raising msg_limit to 220)
@@ -630,6 +633,7 @@ Examples:
             smu.send_msg(PPSMC.SetHardMaxByFreq, param)
             param_min = ((PPCLK.GFXCLK & 0xFFFF) << 16) | (args.clock & 0xFFFF)
             smu.send_msg(PPSMC.SetSoftMinByFreq, param_min)
+            smu.send_msg(PPSMC.SetHardMinByFreq, param_min)
             smu.send_msg(PPSMC.SetPptLimit, args.power)
             # Cycle workload again
             smu.send_msg(PPSMC.SetWorkloadMask, 1 << 2)
