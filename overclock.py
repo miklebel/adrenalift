@@ -29,7 +29,8 @@ Reliability improvements:
   - Verifies patches stick after a short delay
 """
 
-import sys, os, ctypes, struct, time, argparse
+import sys, os, ctypes, struct, time, argparse, threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.stdout.reconfigure(line_buffering=True)
 _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -128,51 +129,98 @@ def read_metrics(smu, virt):
 # Memory scanning
 # ---------------------------------------------------------------------------
 
-def scan_memory(inpout, patterns, max_gb=16, label=""):
-    """Scan physical memory for multiple byte patterns. Returns list of phys addrs.
-    patterns: list of bytes objects to search for (finds any match).
+def scan_memory(inpout, patterns, max_gb=16, label="", num_threads=8):
+    """Scan physical memory for multiple byte patterns using parallel threads.
+
+    Each thread scans a contiguous range of 2MB chunks, mapping physical memory
+    independently.  The InpOut32 driver handles concurrent MapPhysToLin calls
+    safely (each creates a separate kernel MDL).  ctypes FFI calls and memmove
+    release the GIL, so threads get true parallelism on the I/O-bound work.
+
+    Args:
+        patterns: bytes or list of bytes objects to search for (finds any match).
+        max_gb:   Upper bound of physical memory to scan.
+        label:    Informational label for progress output.
+        num_threads: Number of worker threads (default 8).
     """
     if isinstance(patterns, bytes):
         patterns = [patterns]
     max_bytes = max_gb * 1024 * 1024 * 1024
     total_chunks = max_bytes // CHUNK_SIZE
-    found = []
-    t0 = time.perf_counter()
 
+    # Build list of scannable chunk indices (skip PCI hole 3-4 GB)
+    chunk_indices = []
     for ci in range(total_chunks):
         phys_base = ci * CHUNK_SIZE
         if 0xC0000000 <= phys_base < 0x100000000:
             continue
-        try:
-            virt, handle = inpout.map_phys(phys_base, CHUNK_SIZE)
-        except (IOError, OSError):
-            continue
-        try:
-            buf = (ctypes.c_ubyte * CHUNK_SIZE)()
-            ctypes.memmove(buf, virt, CHUNK_SIZE)
-            data = bytes(buf)
-            for pattern in patterns:
-                pos = 0
-                while True:
-                    idx = data.find(pattern, pos)
-                    if idx < 0:
-                        break
-                    addr = phys_base + idx
-                    if addr not in [f for f, _ in found]:
-                        found.append((addr, pattern))
-                    pos = idx + 2
-        finally:
-            inpout.unmap_phys(virt, handle)
+        chunk_indices.append(ci)
 
-        if ci % 512 == 0 and ci > 0:
-            elapsed = time.perf_counter() - t0
-            pct = ci / total_chunks * 100
-            print(f"    {pct:5.1f}%  ({len(found)} found, "
-                  f"{ci * CHUNK_SIZE // (1024*1024*1024)}.{(ci * CHUNK_SIZE // (1024*1024)) % 1024 // 100}GB)")
+    scannable = len(chunk_indices)
+    lock = threading.Lock()
+    progress = [0]  # chunks completed across all threads
+    t0 = time.perf_counter()
+
+    def _scan_range(indices):
+        """Worker: scan a slice of chunk indices, return local matches."""
+        local_found = []
+        for ci in indices:
+            phys_base = ci * CHUNK_SIZE
+            try:
+                virt, handle = inpout.map_phys(phys_base, CHUNK_SIZE)
+            except (IOError, OSError):
+                with lock:
+                    progress[0] += 1
+                continue
+            try:
+                buf = (ctypes.c_ubyte * CHUNK_SIZE)()
+                ctypes.memmove(buf, virt, CHUNK_SIZE)
+                data = bytes(buf)
+                for pattern in patterns:
+                    pos = 0
+                    while True:
+                        idx = data.find(pattern, pos)
+                        if idx < 0:
+                            break
+                        local_found.append((phys_base + idx, pattern))
+                        pos = idx + 2
+            finally:
+                inpout.unmap_phys(virt, handle)
+
+            with lock:
+                progress[0] += 1
+                done = progress[0]
+            if done % 512 == 0:
+                pct = done / scannable * 100
+                gb = done * CHUNK_SIZE / (1024 ** 3)
+                print(f"    {pct:5.1f}%  ({gb:.1f} GB scanned)")
+        return local_found
+
+    # Split chunks evenly across threads
+    per_thread = (scannable + num_threads - 1) // num_threads
+    ranges = [chunk_indices[i * per_thread:(i + 1) * per_thread]
+              for i in range(num_threads)]
+    # Drop empty trailing slices
+    ranges = [r for r in ranges if r]
+
+    all_found = []
+    with ThreadPoolExecutor(max_workers=len(ranges)) as pool:
+        futures = [pool.submit(_scan_range, r) for r in ranges]
+        for fut in as_completed(futures):
+            all_found.extend(fut.result())
+
+    # Deduplicate by address (threads scan disjoint ranges, but belt-and-suspenders)
+    seen = set()
+    deduped = []
+    for addr, pat in all_found:
+        if addr not in seen:
+            seen.add(addr)
+            deduped.append((addr, pat))
 
     elapsed = time.perf_counter() - t0
-    print(f"    Done: {len(found)} match(es) in {elapsed:.1f}s")
-    return found
+    print(f"    Done: {len(deduped)} match(es) in {elapsed:.1f}s  "
+          f"[{len(ranges)} threads, {scannable * CHUNK_SIZE / (1024**3):.1f} GB]")
+    return deduped
 
 
 def read_msglimits(inpout, phys_addr):
@@ -289,6 +337,8 @@ Examples:
                         help='OD PPT percentage (default: 10)')
     parser.add_argument('--max-gb', type=int, default=32,
                         help='Max GB to scan (default: 32)')
+    parser.add_argument('--threads', type=int, default=8,
+                        help='Number of scan threads (default: 8)')
     parser.add_argument('--scan-only', action='store_true',
                         help='Only scan and display, no modifications')
     args = parser.parse_args()
@@ -334,7 +384,7 @@ Examples:
 
         clock_results = scan_memory(inpout,
             [CLOCK_PATTERN, patched_clock_pattern],
-            args.max_gb, "DriverReportedClocks")
+            args.max_gb, "DriverReportedClocks", args.threads)
 
         if not clock_results:
             print("\n  ERROR: PPTable pattern not found in memory!")
@@ -457,7 +507,7 @@ Examples:
         # Also patch any standalone MsgLimits copies
         print(f"\n  Scanning for additional MsgLimits copies...")
         power_results = scan_memory(inpout, POWER_PATTERN, args.max_gb,
-                                    "MsgLimits.Power")
+                                    "MsgLimits.Power", args.threads)
 
         # Filter out ones we already patched (within 256 bytes of a clock match)
         all_known_addrs = set(ca + 28 for ca in clock_addrs)  # both valid and rejected
