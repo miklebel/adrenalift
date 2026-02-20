@@ -126,6 +126,55 @@ def _make_write_mem_buf(phys_addr, data_bytes):
 
 
 # ---------------------------------------------------------------------------
+# Pre-copy driver files (no loading) for consistent first-run behavior
+# ---------------------------------------------------------------------------
+
+
+def ensure_driver_files_copied() -> None:
+    """
+    Copy InpOut32/WinRing0 driver files to the exe directory without loading them.
+    Call at app startup so first run matches post-restart layout (driver files
+    already present). This fixes first-run parse failures when drivers were
+    previously copied only during init_hardware.
+    """
+    py_dir = os.path.dirname(sys.executable)
+    script_dir = os.path.dirname(os.path.abspath(
+        sys.modules[__name__].__file__
+        if hasattr(sys.modules[__name__], "__file__")
+        else __file__
+    ))
+    search_dirs = [
+        os.path.join(script_dir, "drivers"),
+        script_dir,
+        os.getcwd(),
+    ]
+    inpout_src = wr0_dll_src = wr0_sys_src = None
+    for d in search_dirs:
+        if inpout_src is None:
+            p = os.path.join(d, "inpoutx64.dll")
+            if os.path.isfile(p):
+                inpout_src = p
+        if wr0_dll_src is None:
+            p = os.path.join(d, "WinRing0x64.dll")
+            if os.path.isfile(p):
+                wr0_dll_src = p
+        if wr0_sys_src is None:
+            for name in ("WinRing0x64_patched.sys", "WinRing0x64.sys"):
+                p = os.path.join(d, name)
+                if os.path.isfile(p):
+                    wr0_sys_src = p
+                    break
+    try:
+        if inpout_src:
+            shutil.copy2(inpout_src, os.path.join(py_dir, "inpoutx64.dll"))
+        if wr0_dll_src and wr0_sys_src:
+            shutil.copy2(wr0_dll_src, os.path.join(py_dir, "WinRing0x64.dll"))
+            shutil.copy2(wr0_sys_src, os.path.join(py_dir, "WinRing0x64.sys"))
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # WinRing0 class
 # ---------------------------------------------------------------------------
 
