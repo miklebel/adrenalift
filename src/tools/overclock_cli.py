@@ -35,11 +35,11 @@ Reliability improvements:
 import sys, os, time, argparse
 
 sys.stdout.reconfigure(line_buffering=True)
-_script_dir = os.path.dirname(os.path.abspath(__file__))
-if _script_dir not in sys.path:
-    sys.path.insert(0, _script_dir)
+_project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
-from overclock_engine import (
+from src.engine.overclock_engine import (
     OverclockSettings, ScanOptions, ScanResult, ODScanResult,
     init_hardware, cleanup_hardware,
     scan_for_pptable, scan_for_od_table, patch_pptable, apply_od_settings,
@@ -49,7 +49,7 @@ from overclock_engine import (
     ORIG_BASECLOCK_AC, ORIG_GAMECLOCK_AC, ORIG_BOOSTCLOCK_AC,
     ORIG_POWER_AC, ORIG_TDC_GFX,
 )
-from od_table import dump_od_table
+from src.engine.od_table import dump_od_table
 
 
 # ---------------------------------------------------------------------------

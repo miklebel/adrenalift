@@ -28,7 +28,7 @@ Requirements:
 
 import time
 
-from mmio import WinRing0, GpuMMIO, InpOut32
+from src.io.mmio import WinRing0, GpuMMIO, InpOut32
 
 
 # ---------------------------------------------------------------------------

@@ -33,9 +33,9 @@ from typing import Dict, List, Optional, Tuple
 _UPP_AVAILABLE = False
 try:
     if not getattr(sys, "frozen", False):
-        # Running from source: add sibling upp/src to path
+        # Running from source: add sibling upp/src to path (src/io -> project -> upp)
         _script_dir = os.path.dirname(os.path.abspath(__file__))
-        _upp_src = os.path.join(_script_dir, "..", "upp", "src")
+        _upp_src = os.path.join(_script_dir, "..", "..", "..", "upp", "src")
         if os.path.isdir(_upp_src) and _upp_src not in sys.path:
             sys.path.insert(0, os.path.abspath(_upp_src))
     from upp import decode as _upp_decode
@@ -349,7 +349,8 @@ def parse_vbios(
             diagnostic_out.append(msg)
 
     if not os.path.isabs(rom_path):
-        rom_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), rom_path)
+        _proj = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        rom_path = os.path.join(_proj, rom_path)
 
     if not os.path.isfile(rom_path):
         raise FileNotFoundError(rom_path)

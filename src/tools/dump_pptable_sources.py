@@ -10,14 +10,20 @@ This is a diagnostics tool meant to be run directly, e.g.:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import os
+import sys
+
+_project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
+import hashlib
 import re
 import struct
 import time
 from typing import Dict, Iterable, List, Optional, Tuple
 
-import pptable_sources as src
+from src.io import pptable_sources as src
 
 try:
     import winreg  # type: ignore

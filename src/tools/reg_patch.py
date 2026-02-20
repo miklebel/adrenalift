@@ -64,8 +64,8 @@ _DISPLAY_CLASS_PATH = (
 )
 AMD_VENDOR_ID = "VEN_1002"
 
-_script_dir = os.path.dirname(os.path.abspath(__file__))
-BACKUP_FILE = os.path.join(_script_dir, ".reg_backup.json")
+_project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+BACKUP_FILE = os.path.join(_project_root, ".reg_backup.json")
 
 
 # Values we patch: (name, target_value, description)

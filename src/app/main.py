@@ -36,13 +36,13 @@ from PySide6.QtWidgets import (
 if getattr(sys, "frozen", False):
     _script_dir = os.path.dirname(sys.executable)
 else:
-    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    _script_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _script_dir not in sys.path:
     sys.path.insert(0, _script_dir)
 
-from vbios_parser import VbiosValues, parse_vbios, parse_vbios_from_bytes, parse_vbios_or_defaults
-from mmio import ensure_driver_files_copied
-from overclock_engine import (
+from src.io.vbios_parser import VbiosValues, parse_vbios, parse_vbios_from_bytes, parse_vbios_or_defaults
+from src.io.mmio import ensure_driver_files_copied
+from src.engine.overclock_engine import (
     OverclockSettings,
     ScanOptions,
     ScanResult,

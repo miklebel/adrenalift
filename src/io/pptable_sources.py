@@ -57,8 +57,8 @@ def read_rom_blob(path: str) -> Optional[bytes]:
     Read a VBIOS ROM blob from disk.
 
     Args:
-        path: Path to ROM file. If relative, it is resolved relative to this
-              module's directory (same behavior as overclock.py's _script_dir).
+        path: Path to ROM file. If relative, it is resolved relative to
+              project root (parent of src/).
 
     Returns:
         ROM bytes on success, otherwise None.
@@ -67,7 +67,8 @@ def read_rom_blob(path: str) -> Optional[bytes]:
         return None
     p = path
     if not os.path.isabs(p):
-        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), p)
+        _proj = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        p = os.path.join(_proj, p)
     return _read_file_bytes(p)
 
 
@@ -294,7 +295,7 @@ def read_smu_pptable_blob(
     """
     if table_id is None:
         try:
-            from od_table import TABLE_PPTABLE as _TBL  # local import
+            from src.engine.od_table import TABLE_PPTABLE as _TBL
         except Exception:
             _TBL = 0
         table_id = int(_TBL)

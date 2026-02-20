@@ -16,17 +16,17 @@ Requires: Administrator privileges, AMD GPU with driver loaded.
 import sys, os
 
 sys.stdout.reconfigure(line_buffering=True)
-_script_dir = os.path.dirname(os.path.abspath(__file__))
-if _script_dir not in sys.path:
-    sys.path.insert(0, _script_dir)
+_project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
-from overclock_engine import (
+from src.engine.overclock_engine import (
     init_hardware, cleanup_hardware,
     extract_od_pattern, read_od, validate_od_candidate,
     scan_for_od_table, load_cached_addrs,
     ScanOptions,
 )
-from od_table import dump_od_table
+from src.engine.od_table import dump_od_table
 
 
 def cli_progress(pct, msg):

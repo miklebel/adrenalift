@@ -26,13 +26,14 @@ import sys, os, ctypes, struct, time, threading, json
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-_script_dir = os.path.dirname(os.path.abspath(__file__))
-if _script_dir not in sys.path:
-    sys.path.insert(0, _script_dir)
+if getattr(sys, "frozen", False):
+    _project_root = os.path.dirname(sys.executable)
+else:
+    _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from mmio import InpOut32
-from smu import create_smu, PPSMC, PPCLK, SMU_FEATURE
-from od_table import (TABLE_OVERDRIVE, TABLE_SMU_METRICS, TABLE_PPTABLE,
+from src.io.mmio import InpOut32
+from src.engine.smu import create_smu, PPSMC, PPCLK, SMU_FEATURE
+from src.engine.od_table import (TABLE_OVERDRIVE, TABLE_SMU_METRICS, TABLE_PPTABLE,
                       OverDriveTable_t, _OD_TABLE_SIZE,
                       PP_OD_FEATURE_PPT_BIT, PP_OD_FEATURE_GFXCLK_BIT,
                       PP_OD_FEATURE_TDC_BIT, PP_OD_FEATURE_UCLK_BIT,
@@ -59,7 +60,7 @@ POWER_PATTERN = struct.pack('<4H',
     ORIG_POWER_AC, ORIG_POWER_DC, 1200, 1200)
 
 CHUNK_SIZE = 2 * 1024 * 1024  # 2 MB per scan chunk
-CACHE_FILE = os.path.join(_script_dir, ".pptable_phys_cache.json")
+CACHE_FILE = os.path.join(_project_root, ".pptable_phys_cache.json")
 CACHE_MAX_ENTRIES = 32
 
 # MsgLimits_t field offsets (relative to MsgLimits start)

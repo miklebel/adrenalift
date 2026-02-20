@@ -143,8 +143,11 @@ def ensure_driver_files_copied() -> None:
         if hasattr(sys.modules[__name__], "__file__")
         else __file__
     ))
+    # Project root is parent of src/ (script_dir is src/io)
+    project_root = os.path.dirname(os.path.dirname(script_dir))
     search_dirs = [
-        os.path.join(script_dir, "drivers"),
+        os.path.join(project_root, "drivers"),
+        project_root,
         script_dir,
         os.getcwd(),
     ]
@@ -295,14 +298,15 @@ class WinRing0:
         target_dll = os.path.join(py_dir, "WinRing0x64.dll")
         target_sys = os.path.join(py_dir, "WinRing0x64.sys")
 
-        # Search for source files in script dir and CWD
+        # Search for source files: project root drivers/, project root, CWD
         script_dir = os.path.dirname(os.path.abspath(
             sys.modules[__name__].__file__
             if hasattr(sys.modules[__name__], '__file__')
             else __file__
         ))
-        drivers_dir = os.path.join(script_dir, "drivers")
-        search_dirs = list(dict.fromkeys([drivers_dir, script_dir, os.getcwd()]))
+        project_root = os.path.dirname(os.path.dirname(script_dir))
+        drivers_dir = os.path.join(project_root, "drivers")
+        search_dirs = list(dict.fromkeys([drivers_dir, project_root, script_dir, os.getcwd()]))
 
         source_dll = source_sys = None
         patched_sys = None
@@ -341,7 +345,7 @@ class WinRing0:
         if missing:
             raise FileNotFoundError(
                 f"Missing: {', '.join(missing)}\n"
-                f"Place files in: {script_dir}\n"
+                f"Place files in: {project_root}\n"
             )
 
         # Always copy fresh to ensure we're using the right version
@@ -1180,11 +1184,13 @@ class InpOut32:
             if hasattr(sys.modules[__name__], '__file__')
             else __file__
         ))
-        drivers_dir = os.path.join(script_dir, "drivers")
+        project_root = os.path.dirname(os.path.dirname(script_dir))
+        drivers_dir = os.path.join(project_root, "drivers")
         search_paths = [
             os.path.join(drivers_dir, "inpoutx64.dll"),
+            os.path.join(project_root, "inpoutx64.dll"),
+            os.path.join(project_root, "InpOutBinaries", "x64", "inpoutx64.dll"),
             os.path.join(script_dir, "inpoutx64.dll"),
-            os.path.join(script_dir, "InpOutBinaries", "x64", "inpoutx64.dll"),
             os.path.join(os.getcwd(), "inpoutx64.dll"),
             os.path.join(os.getcwd(), "InpOutBinaries", "x64", "inpoutx64.dll"),
         ]
