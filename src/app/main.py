@@ -4,7 +4,7 @@ RDNA4 Overclock GUI -- PySide6 Main Window
 
 Main application window with:
   - VBIOS gate screen: file picker + copy to bios/ when no VBIOS present
-  - Main overclock UI: Simple/Detailed Settings tabs, log panel, progress bar, Apply button
+  - Main overclock UI: Simple Settings, PP, OD, SMU tabs, Memory, Registry Patch, log panel, Apply button
 """
 
 from __future__ import annotations
@@ -54,11 +54,17 @@ try:
     from src.tools.reg_patch import (
         RegistryPatch,
         PATCH_VALUES,
+        VERIFY_VALUES,
+        RECOMMENDED_VALUES,
+        REG_NAME_TO_DISPLAY,
         BACKUP_FILE,
     )
 except (ImportError, RuntimeError):
     RegistryPatch = None
     PATCH_VALUES = []
+    VERIFY_VALUES = []
+    RECOMMENDED_VALUES = {}
+    REG_NAME_TO_DISPLAY = {}
     BACKUP_FILE = None
 from src.engine.overclock_engine import (
     OverclockSettings,
@@ -439,15 +445,19 @@ class MainOverclockWidget(QWidget):
         # Tabs
         self.tabs = QTabWidget()
         self.simple_tab = QWidget()
-        self.detailed_tab = QWidget()
+        self.pp_tab = QWidget()
+        self.od_tab = QWidget()
+        self.smu_tab = QWidget()
         self.memory_tab = QWidget()
         self.registry_tab = QWidget()
         self._setup_simple_tab()
-        self._setup_detailed_tab()
+        self._setup_detailed_tabs()
         self._setup_memory_tab()
         self._setup_registry_tab()
         self.tabs.addTab(self.simple_tab, "Simple Settings")
-        self.tabs.addTab(self.detailed_tab, "Detailed Settings")
+        self.tabs.addTab(self.pp_tab, "PP")
+        self.tabs.addTab(self.od_tab, "OD")
+        self.tabs.addTab(self.smu_tab, "SMU")
         self.tabs.addTab(self.memory_tab, "Memory")
         self.tabs.addTab(self.registry_tab, "Registry Patch")
         layout.addWidget(self.tabs)
@@ -671,15 +681,8 @@ class MainOverclockWidget(QWidget):
         self.progress_bar.setValue(100)
         self.rescan_btn.setEnabled(True)
 
-    def _setup_detailed_tab(self):
-        layout = QVBoxLayout(self.detailed_tab)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        content = QWidget()
-        scroll_layout = QVBoxLayout(content)
-
+    def _setup_detailed_tabs(self):
+        """Set up PP, OD, SMU as separate tabs."""
         vb = self.vbios_values
 
         # Param definitions: (human_name, table_key, source, unit, vbios_val, ram_key, smu_key)
@@ -831,7 +834,12 @@ class MainOverclockWidget(QWidget):
         self.clocks_apply_btn.clicked.connect(self._on_apply_pp)
         self.msglimits_apply_btn = self.clocks_apply_btn  # same button for _set_apply_buttons_enabled
         pp_layout.addWidget(self.clocks_apply_btn)
-        scroll_layout.addWidget(pp_grp)
+
+        pp_scroll = QScrollArea()
+        pp_scroll.setWidgetResizable(True)
+        pp_scroll.setWidget(pp_grp)
+        pp_tab_layout = QVBoxLayout(self.pp_tab)
+        pp_tab_layout.addWidget(pp_scroll)
 
         # (2) OD Section
         od_grp = QGroupBox("OD — OverDrive Table")
@@ -897,7 +905,12 @@ class MainOverclockWidget(QWidget):
         self.od_apply_btn.setToolTip("Sends OD table (offset, PPT%, TDC%, UCLK/FCLK) to SMU via table transfer")
         self.od_apply_btn.clicked.connect(self._on_apply_od)
         od_layout.addWidget(self.od_apply_btn)
-        scroll_layout.addWidget(od_grp)
+
+        od_scroll = QScrollArea()
+        od_scroll.setWidgetResizable(True)
+        od_scroll.setWidget(od_grp)
+        od_tab_layout = QVBoxLayout(self.od_tab)
+        od_tab_layout.addWidget(od_scroll)
 
         # (3) SMU Section
         smu_grp = QGroupBox("SMU — Features")
@@ -928,13 +941,14 @@ class MainOverclockWidget(QWidget):
         self.smu_apply_btn.setToolTip("Sets min-clock floor and DisableSmuFeaturesLow (lock DS_GFXCLK/GFX_ULV/GFXOFF)")
         self.smu_apply_btn.clicked.connect(self._on_apply_smu_features)
         smu_layout.addWidget(self.smu_apply_btn)
-        scroll_layout.addWidget(smu_grp)
 
-        scroll_layout.addStretch()
-        scroll.setWidget(content)
-        layout.addWidget(scroll)
+        smu_scroll = QScrollArea()
+        smu_scroll.setWidgetResizable(True)
+        smu_scroll.setWidget(smu_grp)
+        smu_tab_layout = QVBoxLayout(self.smu_tab)
+        smu_tab_layout.addWidget(smu_scroll)
 
-        # Detailed tab refresh: 1s timer when scan has addrs or od_table
+        # PP/OD/SMU tab refresh: 1s timer when scan has addrs or od_table
         self._detailed_worker = None
         self._detailed_timer = QTimer(self)
         self._detailed_timer.setInterval(1000)
@@ -1035,32 +1049,17 @@ class MainOverclockWidget(QWidget):
         self.reg_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.reg_table.horizontalHeader().setStretchLastSection(True)
 
-        patch_data = self._reg_report.get("patch", {})
-        for name, entry in patch_data.items():
-            row = self.reg_table.rowCount()
-            self.reg_table.insertRow(row)
-            current = entry.get("current")
-            # Checkbox: checked = 1, unchecked = 0
-            current_is_one = current == 1 if current is not None else False
-
-            self.reg_table.setItem(row, 0, QTableWidgetItem(name))
-
-            current_cb = QCheckBox()
-            current_cb.setChecked(current_is_one)
-            current_cb.setEnabled(False)
-            current_cb.setToolTip("Current registry value (read-only)")
-            self.reg_table.setCellWidget(row, 1, current_cb)
-
-            custom_cb = QCheckBox()
-            custom_cb.setChecked(current_is_one)
-            custom_cb.setToolTip("Value to apply: checked=1, unchecked=0")
-            self._reg_checkboxes[name] = custom_cb
-            self.reg_table.setCellWidget(row, 2, custom_cb)
+        self._populate_reg_table(self._reg_report)
 
         layout.addWidget(self.reg_table)
 
         # Buttons
         btn_row = QHBoxLayout()
+        self.reg_select_recommended_btn = QPushButton("Select recommended")
+        self.reg_select_recommended_btn.setToolTip("Fill Custom column with recommended values from reg_patch")
+        self.reg_select_recommended_btn.clicked.connect(self._on_reg_select_recommended)
+        btn_row.addWidget(self.reg_select_recommended_btn)
+
         self.reg_refresh_btn = QPushButton("Refresh")
         self.reg_refresh_btn.clicked.connect(self._on_reg_refresh)
         btn_row.addWidget(self.reg_refresh_btn)
@@ -1161,20 +1160,43 @@ class MainOverclockWidget(QWidget):
             self._reg_report = self._reg_patch.read_current()
             self._update_reg_table(self._reg_report)
 
-    def _update_reg_table(self, report: dict):
-        """Update registry table from report."""
+    def _make_reg_name_cell(self, display_name: str, original_name: str) -> QWidget:
+        """Create Name column cell: display name + ? icon with tooltip showing original key."""
+        cell = QWidget()
+        layout = QHBoxLayout(cell)
+        layout.setContentsMargins(4, 0, 4, 0)
+        layout.setSpacing(4)
+        label = QLabel(display_name)
+        layout.addWidget(label)
+        hint_btn = QToolButton()
+        hint_btn.setText("?")
+        hint_btn.setToolTip(original_name)
+        hint_btn.setFixedSize(18, 18)
+        hint_btn.setStyleSheet("font-size: 10pt; font-weight: bold;")
+        layout.addWidget(hint_btn)
+        layout.addStretch()
+        return cell
+
+    def _populate_reg_table(self, report: dict):
+        """Populate or refresh registry table from report (patch + verify)."""
         if not hasattr(self, "reg_table") or self.reg_table is None:
             return
-        patch_data = report.get("patch", {})
         self.reg_table.setRowCount(0)
         self._reg_checkboxes.clear()
-        for name, entry in patch_data.items():
-            row = self.reg_table.rowCount()
-            self.reg_table.insertRow(row)
+        patch_data = report.get("patch", {})
+        verify_data = report.get("verify", {})
+        # Merge: patch first, then verify (order matches reg_patch)
+        combined = list(patch_data.items()) + list(verify_data.items())
+        for name, entry in combined:
+            target = entry.get("target", entry.get("expected", 0))
             current = entry.get("current")
             current_is_one = current == 1 if current is not None else False
 
-            self.reg_table.setItem(row, 0, QTableWidgetItem(name))
+            row = self.reg_table.rowCount()
+            self.reg_table.insertRow(row)
+            display_name = REG_NAME_TO_DISPLAY.get(name, name) if REG_NAME_TO_DISPLAY else name
+            name_cell = self._make_reg_name_cell(display_name, name)
+            self.reg_table.setCellWidget(row, 0, name_cell)
 
             current_cb = QCheckBox()
             current_cb.setChecked(current_is_one)
@@ -1187,6 +1209,19 @@ class MainOverclockWidget(QWidget):
             custom_cb.setToolTip("Value to apply: checked=1, unchecked=0")
             self._reg_checkboxes[name] = custom_cb
             self.reg_table.setCellWidget(row, 2, custom_cb)
+
+    def _on_reg_select_recommended(self):
+        """Set all Custom checkboxes to recommended values."""
+        if not RECOMMENDED_VALUES:
+            return
+        for name, cb in self._reg_checkboxes.items():
+            recommended = RECOMMENDED_VALUES.get(name)
+            if recommended is not None:
+                cb.setChecked(recommended == 1)
+
+    def _update_reg_table(self, report: dict):
+        """Update registry table from report."""
+        self._populate_reg_table(report)
 
     def _on_memory_refresh_tick(self):
         """Timer tick: refresh memory table if we have addrs and worker is idle."""
@@ -1476,7 +1511,15 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("RDNA4 Overclock")
         self.setMinimumSize(520, 480)
-        self.resize(600, 560)
+        # Start at 1000x1000, clamped to screen dimensions
+        screen = QApplication.primaryScreen()
+        if screen:
+            geom = screen.availableGeometry()
+            w = min(1000, geom.width())
+            h = min(1000, geom.height())
+            self.resize(w, h)
+        else:
+            self.resize(1000, 1000)
 
         self.stacked = QStackedWidget()
         self.setCentralWidget(self.stacked)

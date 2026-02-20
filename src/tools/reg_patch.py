@@ -90,6 +90,20 @@ VERIFY_VALUES: List[Tuple[str, int, str]] = [
     ("GCOOPTION_DisableGPIOPowerSaveMode", 1, "GPIO power-save mode disabled"),
 ]
 
+# Recommended values for UI "Select recommended" (name -> target value).
+RECOMMENDED_VALUES: Dict[str, int] = {}
+for _n, _v, _ in PATCH_VALUES:
+    RECOMMENDED_VALUES[_n] = _v
+for _n, _v, _ in VERIFY_VALUES:
+    RECOMMENDED_VALUES[_n] = _v
+
+# Translation: registry key name -> display name for UI.
+REG_NAME_TO_DISPLAY: Dict[str, str] = {}
+for _n, _, _d in PATCH_VALUES:
+    REG_NAME_TO_DISPLAY[_n] = _d
+for _n, _, _d in VERIFY_VALUES:
+    REG_NAME_TO_DISPLAY[_n] = _d
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -305,20 +319,23 @@ class RegistryPatch:
         Returns:
             List of (name, old_value, new_value) for each changed entry.
         """
-        # Read originals first (for backup)
+        # Read originals first (for backup) — include both PATCH and VERIFY values
         originals: Dict[str, Optional[int]] = {}
         with winreg.OpenKey(
             winreg.HKEY_LOCAL_MACHINE, self.key_path, 0, winreg.KEY_READ
         ) as k:
             for name, target, desc in PATCH_VALUES:
                 originals[name] = _read_dword(k, name)
+            for name, expected, desc in VERIFY_VALUES:
+                originals[name] = _read_dword(k, name)
 
         if not dry_run and not os.path.isfile(BACKUP_FILE):
             self._save_backup(originals)
 
         # Build (name, target) list: use values dict if provided, else PATCH_VALUES
+        all_names = {n for n, _, _ in PATCH_VALUES} | {n for n, _, _ in VERIFY_VALUES}
         if values is not None:
-            items_to_patch = [(n, v) for n, v in values.items() if n in originals]
+            items_to_patch = [(n, v) for n, v in values.items() if n in all_names]
         else:
             items_to_patch = [
                 (name, target)
