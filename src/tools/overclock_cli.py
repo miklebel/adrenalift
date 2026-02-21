@@ -44,7 +44,6 @@ from src.engine.overclock_engine import (
     init_hardware, cleanup_hardware,
     scan_for_pptable, scan_for_od_table, patch_pptable, apply_od_settings,
     verify_patches, extract_od_pattern, read_od, validate_od_candidate,
-    load_cached_addrs,
     get_gpu_state, get_dpm_ranges, read_metrics, watchdog_step,
     ORIG_BASECLOCK_AC, ORIG_GAMECLOCK_AC, ORIG_BOOSTCLOCK_AC,
     ORIG_POWER_AC, ORIG_TDC_GFX,
@@ -217,12 +216,6 @@ Examples:
     parser.add_argument('--fast-window-mb', type=int, default=512,
                         help='Fast pre-scan window size around cached '
                              'addresses (default: 512)')
-    parser.add_argument('--cache-max-addrs', type=int, default=16,
-                        help='How many ranked cached addresses to '
-                             'probe/scan (default: 16)')
-    parser.add_argument('--no-cache-fastpath', action='store_true',
-                        help='Disable cached-address fast discovery '
-                             'and use full scan only')
     parser.add_argument('--scan-only', action='store_true',
                         help='Only scan and display, no modifications')
     parser.add_argument('--min-clock', type=int, default=0,
@@ -262,8 +255,6 @@ Examples:
         max_gb=args.max_gb,
         num_threads=args.threads,
         fast_window_mb=args.fast_window_mb,
-        cache_max_addrs=args.cache_max_addrs,
-        no_cache_fastpath=args.no_cache_fastpath,
     )
 
     print("=" * 62)
@@ -333,15 +324,8 @@ Examples:
                 print("  ERROR: Could not read OD table from SMU.")
                 return
             print(f"  Pattern ({len(pattern)} bytes): {pattern.hex(' ')}")
-            pptable_addrs = None
-            if not scan_opts.no_cache_fastpath:
-                pptable_addrs = load_cached_addrs(
-                    max_entries=scan_opts.cache_max_addrs)
-                if pptable_addrs:
-                    print(f"  Using {len(pptable_addrs)} cached PPTable addr(s) for proximity scan")
             od_result = scan_for_od_table(
                 inpout, pattern,
-                pptable_addrs=pptable_addrs,
                 scan_opts=scan_opts,
                 progress_callback=cli_progress,
             )

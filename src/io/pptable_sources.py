@@ -54,14 +54,7 @@ def _read_file_bytes(path: str) -> Optional[bytes]:
 
 def read_rom_blob(path: str) -> Optional[bytes]:
     """
-    Read a VBIOS ROM blob from disk.
-
-    Args:
-        path: Path to ROM file. If relative, it is resolved relative to
-              project root (parent of src/).
-
-    Returns:
-        ROM bytes on success, otherwise None.
+    Read a VBIOS ROM blob from disk. Decodes if stored in encoded format (VBEN magic).
     """
     if not path:
         return None
@@ -69,7 +62,9 @@ def read_rom_blob(path: str) -> Optional[bytes]:
     if not os.path.isabs(p):
         _proj = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         p = os.path.join(_proj, p)
-    return _read_file_bytes(p)
+    from src.io.vbios_storage import read_vbios_decoded
+    decoded, _ = read_vbios_decoded(p)
+    return decoded
 
 
 def _enum_subkeys(root, path: str) -> Iterable[str]:

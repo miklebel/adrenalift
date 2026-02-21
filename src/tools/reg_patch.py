@@ -286,7 +286,12 @@ class RegistryPatch:
 
     # ---- Apply ----
 
-    def apply(self, dry_run: bool = False) -> List[Tuple[str, Optional[int], int]]:
+    def apply(
+        self,
+        dry_run: bool = False,
+        only_names: Optional[List[str]] = None,
+        values: Optional[Dict[str, int]] = None,
+    ) -> List[Tuple[str, Optional[int], int]]:
         """
         Apply anti-clock-gating patches to the registry.
 
@@ -294,6 +299,8 @@ class RegistryPatch:
 
         Args:
             dry_run: If True, only report what would change without writing.
+            only_names: If provided, only patch these value names. Otherwise patch all.
+            values: If provided, custom target values {name: 0|1}. Overrides PATCH_VALUES targets.
 
         Returns:
             List of (name, old_value, new_value) for each changed entry.
@@ -306,14 +313,24 @@ class RegistryPatch:
             for name, target, desc in PATCH_VALUES:
                 originals[name] = _read_dword(k, name)
 
-        if not dry_run:
+        if not dry_run and not os.path.isfile(BACKUP_FILE):
             self._save_backup(originals)
+
+        # Build (name, target) list: use values dict if provided, else PATCH_VALUES
+        if values is not None:
+            items_to_patch = [(n, v) for n, v in values.items() if n in originals]
+        else:
+            items_to_patch = [
+                (name, target)
+                for name, target, desc in PATCH_VALUES
+                if only_names is None or name in (only_names or [])
+            ]
 
         changes: List[Tuple[str, Optional[int], int]] = []
 
         if dry_run:
-            for name, target, desc in PATCH_VALUES:
-                old = originals[name]
+            for name, target in items_to_patch:
+                old = originals.get(name)
                 if old != target:
                     changes.append((name, old, target))
             return changes
@@ -322,12 +339,11 @@ class RegistryPatch:
             winreg.HKEY_LOCAL_MACHINE, self.key_path, 0,
             winreg.KEY_READ | winreg.KEY_SET_VALUE
         ) as k:
-            for name, target, desc in PATCH_VALUES:
-                old = originals[name]
+            for name, target in items_to_patch:
+                old = originals.get(name)
                 if old == target:
                     continue
                 _write_dword(k, name, target)
-                # Verify write
                 verify = _read_dword(k, name)
                 changes.append((name, old, verify if verify is not None else target))
 

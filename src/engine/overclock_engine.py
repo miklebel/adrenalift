@@ -22,7 +22,7 @@ printing directly, so callers control presentation.
 Safe: Non-persistent.  Reboot always restores stock values.
 """
 
-import sys, os, ctypes, struct, time, threading, json
+import sys, os, ctypes, struct, time, threading
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -60,8 +60,6 @@ POWER_PATTERN = struct.pack('<4H',
     ORIG_POWER_AC, ORIG_POWER_DC, 1200, 1200)
 
 CHUNK_SIZE = 2 * 1024 * 1024  # 2 MB per scan chunk
-CACHE_FILE = os.path.join(_project_root, ".pptable_phys_cache.json")
-CACHE_MAX_ENTRIES = 32
 
 # MsgLimits_t field offsets (relative to MsgLimits start)
 ML_PPT0_AC  = 0
@@ -148,8 +146,6 @@ class ScanOptions:
     max_gb: int = 32
     num_threads: int = 0
     fast_window_mb: int = 512
-    cache_max_addrs: int = 16
-    no_cache_fastpath: bool = False
 
 
 @dataclass
@@ -258,6 +254,30 @@ def read_metrics(smu, virt):
     return gfxclk, gfxclk2, ppt, temp
 
 
+def read_clock_block(inpout, phys_addr):
+    """Read clock block (Base, Game, Boost) at phys_addr. Offsets 0, 2, 4.
+    Returns dict with baseclock_ac, gameclock_ac, boostclock_ac, or None if unreadable."""
+    page_base = phys_addr & ~0xFFF
+    page_off = phys_addr - page_base
+    if page_off + 6 > 4096:
+        map_size = 8192
+    else:
+        map_size = 4096
+    try:
+        virt, handle = inpout.map_phys(page_base, map_size)
+    except (IOError, OSError):
+        return None
+    try:
+        data = read_buf(virt + page_off, 6)
+    finally:
+        inpout.unmap_phys(virt, handle)
+    return {
+        'baseclock_ac':  struct.unpack_from('<H', data, 0)[0],
+        'gameclock_ac':  struct.unpack_from('<H', data, 2)[0],
+        'boostclock_ac': struct.unpack_from('<H', data, 4)[0],
+    }
+
+
 def read_msglimits(inpout, phys_addr):
     """Read MsgLimits_t at a physical address. Returns dict of values."""
     page_base = phys_addr & ~0xFFF
@@ -276,8 +296,55 @@ def read_msglimits(inpout, phys_addr):
         'tdc_soc':      struct.unpack_from('<H', data, ML_TDC_SOC)[0],
         'temp_edge':    struct.unpack_from('<H', data, ML_TEMP_EDGE)[0],
         'temp_hotspot': struct.unpack_from('<H', data, ML_TEMP_HOTSPOT)[0],
+        'temp_hsgfx':   struct.unpack_from('<H', data, ML_TEMP_HSGFX)[0],
+        'temp_hssoc':   struct.unpack_from('<H', data, ML_TEMP_HSSOC)[0],
         'temp_mem':     struct.unpack_from('<H', data, ML_TEMP_MEM)[0],
         'temp_vr_gfx':  struct.unpack_from('<H', data, ML_TEMP_VR_GFX)[0],
+        'temp_vr_soc':  struct.unpack_from('<H', data, ML_TEMP_VR_SOC)[0],
+    }
+
+
+def read_pptable_at_addr(inpout, phys_addr):
+    """Read clocks + MsgLimits from PPTable at phys_addr.
+    phys_addr = clock block base; MsgLimits at phys_addr+28.
+    Returns dict with baseclock_ac, gameclock_ac, boostclock_ac, ppt0_ac, ppt0_dc,
+    tdc_gfx, tdc_soc, temp_edge, temp_hotspot, temp_mem, temp_vr_gfx, temp_vr_soc,
+    temp_hsgfx, temp_hssoc, ppt1_ac, ppt1_dc. Returns None if unreadable."""
+    page_base = phys_addr & ~0xFFF
+    page_off = phys_addr - page_base
+    if page_off + 72 > 4096:
+        map_size = 8192
+    else:
+        map_size = 4096
+    try:
+        virt, handle = inpout.map_phys(page_base, map_size)
+    except (IOError, OSError):
+        return None
+    try:
+        clock_data = read_buf(virt + page_off, 6)
+        ml_data = read_buf(virt + page_off + 28, 44)
+    except (IOError, OSError):
+        return None
+    finally:
+        inpout.unmap_phys(virt, handle)
+
+    return {
+        'baseclock_ac':  struct.unpack_from('<H', clock_data, 0)[0],
+        'gameclock_ac':  struct.unpack_from('<H', clock_data, 2)[0],
+        'boostclock_ac': struct.unpack_from('<H', clock_data, 4)[0],
+        'ppt0_ac':       struct.unpack_from('<H', ml_data, ML_PPT0_AC)[0],
+        'ppt0_dc':       struct.unpack_from('<H', ml_data, ML_PPT0_DC)[0],
+        'ppt1_ac':       struct.unpack_from('<H', ml_data, ML_PPT1_AC)[0],
+        'ppt1_dc':       struct.unpack_from('<H', ml_data, ML_PPT1_DC)[0],
+        'tdc_gfx':       struct.unpack_from('<H', ml_data, ML_TDC_GFX)[0],
+        'tdc_soc':       struct.unpack_from('<H', ml_data, ML_TDC_SOC)[0],
+        'temp_edge':     struct.unpack_from('<H', ml_data, ML_TEMP_EDGE)[0],
+        'temp_hotspot':  struct.unpack_from('<H', ml_data, ML_TEMP_HOTSPOT)[0],
+        'temp_hsgfx':    struct.unpack_from('<H', ml_data, ML_TEMP_HSGFX)[0],
+        'temp_hssoc':    struct.unpack_from('<H', ml_data, ML_TEMP_HSSOC)[0],
+        'temp_mem':      struct.unpack_from('<H', ml_data, ML_TEMP_MEM)[0],
+        'temp_vr_gfx':   struct.unpack_from('<H', ml_data, ML_TEMP_VR_GFX)[0],
+        'temp_vr_soc':   struct.unpack_from('<H', ml_data, ML_TEMP_VR_SOC)[0],
     }
 
 
@@ -366,126 +433,6 @@ def patch_u16(inpout, phys_addr, offset, new_val):
         return old, verify
     finally:
         inpout.unmap_phys(virt, handle)
-
-
-# ---------------------------------------------------------------------------
-# Address cache
-# ---------------------------------------------------------------------------
-
-def _parse_cache_addr(v):
-    if isinstance(v, int):
-        return v
-    if isinstance(v, str):
-        return int(v, 16) if v.startswith("0x") else int(v)
-    raise ValueError("Unsupported address type")
-
-
-def load_cached_addrs(max_entries=CACHE_MAX_ENTRIES):
-    """Load cached PPTable addresses, ranked by hit-count + recency."""
-    try:
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        entries = data.get("entries", None)
-        ranked = []
-
-        if isinstance(entries, list):
-            for e in entries:
-                if not isinstance(e, dict):
-                    continue
-                try:
-                    addr = _parse_cache_addr(e.get("addr"))
-                except Exception:
-                    continue
-                hits = int(e.get("hits", 1))
-                last_seen = int(e.get("last_seen_unix", 0))
-                ranked.append((addr, max(1, hits), max(0, last_seen)))
-        else:
-            addrs = data.get("valid_addrs", [])
-            if isinstance(addrs, list):
-                for a in addrs:
-                    try:
-                        ranked.append((_parse_cache_addr(a), 1, 0))
-                    except Exception:
-                        continue
-
-        merged = {}
-        for addr, hits, last_seen in ranked:
-            prev = merged.get(addr)
-            if prev is None or (hits, last_seen) > prev:
-                merged[addr] = (hits, last_seen)
-
-        ordered = sorted(
-            merged.items(),
-            key=lambda kv: (-kv[1][0], -kv[1][1], kv[0])
-        )
-        return [addr for addr, _meta in ordered[:max_entries]]
-    except Exception:
-        return []
-
-
-def save_cached_addrs(addrs, max_entries=CACHE_MAX_ENTRIES):
-    """Persist cached PPTable addresses with frequency + recency ranking."""
-    now = int(time.time())
-    try:
-        try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                old = json.load(f)
-        except Exception:
-            old = {}
-
-        state = {}
-        old_entries = old.get("entries", None)
-        if isinstance(old_entries, list):
-            for e in old_entries:
-                if not isinstance(e, dict):
-                    continue
-                try:
-                    addr = _parse_cache_addr(e.get("addr"))
-                except Exception:
-                    continue
-                hits = int(e.get("hits", 1))
-                last_seen = int(e.get("last_seen_unix", 0))
-                state[addr] = [max(1, hits), max(0, last_seen)]
-        else:
-            for a in (old.get("valid_addrs", [])
-                      if isinstance(old.get("valid_addrs", []), list) else []):
-                try:
-                    addr = _parse_cache_addr(a)
-                except Exception:
-                    continue
-                state.setdefault(addr, [1, 0])
-
-        for addr in sorted(set(addrs)):
-            if addr in state:
-                state[addr][0] += 1
-                state[addr][1] = now
-            else:
-                state[addr] = [1, now]
-
-        ranked = sorted(
-            state.items(),
-            key=lambda kv: (-kv[1][0], -kv[1][1], kv[0])
-        )[:max_entries]
-
-        payload = {
-            "schema": 2,
-            "saved_at_unix": now,
-            "entries": [
-                {
-                    "addr": f"0x{addr:012X}",
-                    "hits": meta[0],
-                    "last_seen_unix": meta[1],
-                }
-                for addr, meta in ranked
-            ],
-            "valid_addrs": [f"0x{addr:012X}" for addr, _meta in ranked],
-        }
-
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-    except Exception:
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -668,34 +615,6 @@ def scan_memory_windows(inpout, patterns, centers, window_mb=512,
     return deduped
 
 
-def probe_cached_addrs(inpout, patterns, cached_addrs):
-    """Check exact cached addresses (near-instant). Returns list of (addr, pat)."""
-    if isinstance(patterns, bytes):
-        patterns = [patterns]
-    if not cached_addrs:
-        return []
-
-    max_pat = max(len(p) for p in patterns)
-    hits = []
-    for addr in cached_addrs:
-        page_base = addr & ~0xFFF
-        page_off = addr - page_base
-        map_size = 8192 if page_off + max_pat <= 8192 else 12288
-        try:
-            virt, handle = inpout.map_phys(page_base, map_size)
-        except (IOError, OSError):
-            continue
-        try:
-            raw = read_buf(virt + page_off, max_pat)
-            for p in patterns:
-                if raw[:len(p)] == p:
-                    hits.append((addr, p))
-                    break
-        finally:
-            inpout.unmap_phys(virt, handle)
-    return hits
-
-
 # ---------------------------------------------------------------------------
 # High-level API
 # ---------------------------------------------------------------------------
@@ -777,7 +696,6 @@ def scan_for_pptable(inpout, settings, scan_opts=None, progress_callback=None,
                      vbios_values=None):
     """Scan physical memory for the driver's cached PPTable.
 
-    Uses a tiered strategy: exact cache probe -> window scan -> full scan.
     Validates each match against MsgLimits sanity checks.
 
     Args:
@@ -809,52 +727,7 @@ def scan_for_pptable(inpout, settings, scan_opts=None, progress_callback=None,
     clock_results = []
     did_full_scan = False
 
-    # --- Fast path: cache probe + window scan ---
-    if not scan_opts.no_cache_fastpath:
-        cached_addrs = load_cached_addrs(
-            max_entries=max(1, scan_opts.cache_max_addrs))
-        if cached_addrs:
-            cb(1, f"Probing {len(cached_addrs)} cached address(es)...")
-            exact_hits = probe_cached_addrs(inpout, search_patterns,
-                                            cached_addrs)
-            if exact_hits:
-                cb(3, f"Exact cached hits: {len(exact_hits)}")
-                clock_results.extend(exact_hits)
-
-            stages = sorted(set([
-                max(64, scan_opts.fast_window_mb // 4),
-                max(128, scan_opts.fast_window_mb // 2),
-                max(256, scan_opts.fast_window_mb),
-            ]))
-            for si, wmb in enumerate(stages):
-                max_centers = (min(max(1, scan_opts.cache_max_addrs), 4)
-                               if clock_results
-                               else scan_opts.cache_max_addrs)
-                pct_lo = 5 + (si / len(stages)) * 20
-                pct_hi = 5 + ((si + 1) / len(stages)) * 20
-                cb(pct_lo,
-                   f"Window scan: {wmb} MB around top "
-                   f"{max_centers} cached address(es)...")
-                window_hits = scan_memory_windows(
-                    inpout, search_patterns, cached_addrs, wmb,
-                    max_centers=max_centers,
-                    num_threads=scan_opts.num_threads,
-                    progress_callback=_map_progress(cb, pct_lo, pct_hi),
-                )
-                clock_results.extend(window_hits)
-                if window_hits:
-                    break
-
-            # Deduplicate
-            dedup = {}
-            for addr, pat in clock_results:
-                dedup[addr] = pat
-            clock_results = [(a, p) for a, p in sorted(dedup.items())]
-            if clock_results:
-                cb(28, f"Fast path found {len(clock_results)} "
-                   f"candidate match(es)")
-
-    # --- Full scan fallback ---
+    # --- Full physical memory scan ---
     if not clock_results:
         cb(30, "Starting full physical memory scan...")
         clock_results = scan_memory(
@@ -931,7 +804,6 @@ def scan_for_pptable(inpout, settings, scan_opts=None, progress_callback=None,
             return ScanResult([], [], [], [], True, [],
                               error="PPTable pattern not found in memory")
 
-    save_cached_addrs(valid_addrs)
     cb(100, f"Found {len(valid_addrs)} valid PPTable(s), "
        f"{len(rejected_addrs)} rejected")
 
@@ -949,8 +821,8 @@ def scan_for_od_table(inpout, pattern, pptable_addrs=None, scan_opts=None,
                      progress_callback=None):
     """Scan physical memory for OD table using SMU-extracted pattern.
 
-    Uses tiered strategy: probe cached PPTable addrs -> window scan ->
-    full scan. Validates each match via validate_od_candidate().
+    Uses tiered strategy: probe pptable addrs -> window scan -> full scan
+    when pptable_addrs provided. Validates each match via validate_od_candidate().
 
     Args:
         inpout: InpOut32 driver instance
@@ -973,14 +845,26 @@ def scan_for_od_table(inpout, pattern, pptable_addrs=None, scan_opts=None,
     all_matches = []
     did_full_scan = False
 
-    # Phase 1: Probe cached PPTable addrs + window scan
-    cached_addrs = load_cached_addrs(max_entries=scan_opts.cache_max_addrs)
-    centers = list(set((pptable_addrs or []) + cached_addrs))
+    # Phase 1: Probe pptable addrs + window scan (when pptable_addrs provided)
+    centers = list(set(pptable_addrs or []))
 
     if centers:
         cb(5, f"Probing {len(centers)} address(es) for OD pattern...")
-        hits = probe_cached_addrs(inpout, [pattern], centers)
-        all_matches.extend(hits)
+        max_pat = len(pattern)
+        for addr in centers:
+            page_base = addr & ~0xFFF
+            page_off = addr - page_base
+            map_size = 8192 if page_off + max_pat <= 8192 else 12288
+            try:
+                virt, handle = inpout.map_phys(page_base, map_size)
+            except (IOError, OSError):
+                continue
+            try:
+                raw = read_buf(virt + page_off, max_pat)
+                if raw[:max_pat] == pattern:
+                    all_matches.append((addr, pattern))
+            finally:
+                inpout.unmap_phys(virt, handle)
 
         if not all_matches:
             cb(15, f"Window scan around PPTable addrs ({scan_opts.fast_window_mb} MB)...")

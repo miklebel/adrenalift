@@ -23,7 +23,7 @@ if _project_root not in sys.path:
 from src.engine.overclock_engine import (
     init_hardware, cleanup_hardware,
     extract_od_pattern, read_od, validate_od_candidate,
-    scan_for_od_table, load_cached_addrs,
+    scan_for_od_table,
     ScanOptions,
 )
 from src.engine.od_table import dump_od_table
@@ -77,13 +77,8 @@ def main():
         print(f"\n  Pattern ({len(pattern)} bytes): {pattern.hex(' ')}")
 
         scan_opts = ScanOptions()
-        pptable_addrs = load_cached_addrs(max_entries=scan_opts.cache_max_addrs)
-        if pptable_addrs:
-            print(f"  Using {len(pptable_addrs)} cached PPTable addr(s) for proximity scan")
-
         result = scan_for_od_table(
             inpout, pattern,
-            pptable_addrs=pptable_addrs,
             scan_opts=scan_opts,
             progress_callback=cli_progress,
         )
