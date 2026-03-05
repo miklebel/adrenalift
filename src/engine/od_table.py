@@ -47,6 +47,7 @@ TABLE_ACTIVITY_MONITOR     = 7
 TABLE_OVERDRIVE            = 8
 TABLE_I2C_COMMANDS         = 9
 TABLE_DRIVER_INFO          = 10
+TABLE_ECCINFO              = 11  # ECC counters (RDNA3/RDNA4, smu14_driver_if_v14_0.h)
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +69,84 @@ PP_OD_FEATURE_ZERO_FAN_BIT      = 11
 PP_OD_FEATURE_TEMPERATURE_BIT   = 12
 PP_OD_FEATURE_EDC_BIT           = 13
 PP_OD_FEATURE_COUNT              = 14
+
+# OD_FAIL_e -- SMU rejection codes (smu14_driver_if_v14_0.h)
+# When TransferTableDram2Smu returns FAIL, PARAM may contain this code.
+OD_NO_ERROR = 0
+OD_REQUEST_ADVANCED_NOT_SUPPORTED = 1
+OD_UNSUPPORTED_FEATURE = 2
+OD_INVALID_FEATURE_COMBO_ERROR = 3
+OD_GFXCLK_VF_CURVE_OFFSET_ERROR = 4
+OD_VDD_GFX_VMAX_ERROR = 5
+OD_VDD_SOC_VMAX_ERROR = 6
+OD_PPT_ERROR = 7
+OD_FAN_MIN_PWM_ERROR = 8
+OD_FAN_ACOUSTIC_TARGET_ERROR = 9
+OD_FAN_ACOUSTIC_LIMIT_ERROR = 10
+OD_FAN_TARGET_TEMP_ERROR = 11
+OD_FAN_ZERO_RPM_STOP_TEMP_ERROR = 12
+OD_FAN_CURVE_PWM_ERROR = 13
+OD_FAN_CURVE_TEMP_ERROR = 14
+OD_FULL_CTRL_GFXCLK_ERROR = 15
+OD_FULL_CTRL_UCLK_ERROR = 16
+OD_FULL_CTRL_FCLK_ERROR = 17
+OD_FULL_CTRL_VDD_GFX_ERROR = 18
+OD_FULL_CTRL_VDD_SOC_ERROR = 19
+OD_TDC_ERROR = 20
+OD_GFXCLK_ERROR = 21
+OD_UCLK_ERROR = 22
+OD_FCLK_ERROR = 23
+OD_OP_TEMP_ERROR = 24
+OD_OP_GFX_EDC_ERROR = 25
+OD_OP_GFX_PCC_ERROR = 26
+OD_POWER_FEATURE_CTRL_ERROR = 27
+
+_OD_FAIL_NAMES = {
+    OD_NO_ERROR: "No error",
+    OD_REQUEST_ADVANCED_NOT_SUPPORTED: "Advanced OD mode not supported",
+    OD_UNSUPPORTED_FEATURE: "Unsupported feature",
+    OD_INVALID_FEATURE_COMBO_ERROR: "Invalid feature combination",
+    OD_GFXCLK_VF_CURVE_OFFSET_ERROR: "GFX V/F curve offset invalid",
+    OD_VDD_GFX_VMAX_ERROR: "VddGfx Vmax invalid",
+    OD_VDD_SOC_VMAX_ERROR: "VddSoc Vmax invalid",
+    OD_PPT_ERROR: "PPT invalid",
+    OD_FAN_MIN_PWM_ERROR: "Fan min PWM invalid",
+    OD_FAN_ACOUSTIC_TARGET_ERROR: "Fan acoustic target invalid",
+    OD_FAN_ACOUSTIC_LIMIT_ERROR: "Fan acoustic limit invalid",
+    OD_FAN_TARGET_TEMP_ERROR: "Fan target temp invalid",
+    OD_FAN_ZERO_RPM_STOP_TEMP_ERROR: "Fan zero-RPM stop temp invalid",
+    OD_FAN_CURVE_PWM_ERROR: "Fan curve PWM invalid",
+    OD_FAN_CURVE_TEMP_ERROR: "Fan curve temp invalid",
+    OD_FULL_CTRL_GFXCLK_ERROR: "Full-ctrl GFXCLK invalid",
+    OD_FULL_CTRL_UCLK_ERROR: "Full-ctrl UCLK invalid",
+    OD_FULL_CTRL_FCLK_ERROR: "Full-ctrl FCLK invalid",
+    OD_FULL_CTRL_VDD_GFX_ERROR: "Full-ctrl VddGfx invalid",
+    OD_FULL_CTRL_VDD_SOC_ERROR: "Full-ctrl VddSoc invalid",
+    OD_TDC_ERROR: "TDC invalid",
+    OD_GFXCLK_ERROR: "GFXCLK invalid",
+    OD_UCLK_ERROR: "UCLK invalid (value out of DPM range or UclkFmin > UclkFmax)",
+    OD_FCLK_ERROR: "FCLK invalid",
+    OD_OP_TEMP_ERROR: "Max op temp invalid",
+    OD_OP_GFX_EDC_ERROR: "Gfx EDC invalid",
+    OD_OP_GFX_PCC_ERROR: "Gfx PCC limit invalid",
+    OD_POWER_FEATURE_CTRL_ERROR: "Power feature ctrl error",
+}
+
+
+def decode_od_fail(param_value: int | None) -> str:
+    """Decode PARAM register when TransferTableDram2Smu returns FAIL.
+    SMU may put OD_FAIL_e in upper 16 bits; lower bits vary by firmware."""
+    if param_value is None:
+        return "SMU rejected OD table (no detail)"
+    param_value = param_value & 0xFFFFFFFF  # ensure uint32
+    code = (param_value >> 16) & 0xFF  # try high byte (e.g. 0x000200FF -> 2)
+    if code in _OD_FAIL_NAMES:
+        return _OD_FAIL_NAMES[code]
+    code = param_value & 0xFF
+    if code in _OD_FAIL_NAMES:
+        return _OD_FAIL_NAMES[code]
+    return f"SMU rejected OD table (PARAM=0x{param_value:08X}, try OD error code in high/low bits)"
+
 
 _OD_FEATURE_NAMES = {
     PP_OD_FEATURE_GFX_VF_CURVE_BIT:  "GFX_VF_CURVE",

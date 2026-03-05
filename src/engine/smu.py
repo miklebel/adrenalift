@@ -26,9 +26,12 @@ Requirements:
     - Administrator privileges (WinRing0 driver)
 """
 
+import logging
 import time
 
 from src.io.mmio import WinRing0, GpuMMIO, InpOut32
+
+_smu_log = logging.getLogger("overclock.smu")
 
 
 # ---------------------------------------------------------------------------
@@ -143,8 +146,34 @@ class PPSMC:
     # Fan
     SetMGpuFanBoostLimitRpm    = 0x3C
 
+    # DCS
+    AllowGfxDcs                = 0x43
+    DisallowGfxDcs             = 0x44
+
+    # Misc control
+    EnableAudioStutterWA       = 0x45
+    PowerUpUmsch               = 0x46
+    PowerDownUmsch             = 0x47
+    SetDcsArch                 = 0x48
+    SetNumBadMemoryPagesRetired = 0x4A
+    SetBadMemoryPagesRetiredFlagsPerChannel = 0x4B
+    SetPriorityDeltaGain       = 0x4C
+    AllowIHHostInterrupt       = 0x4D
+    EnableShadowDpm            = 0x4E
+
+    # 64-bit features in one call
+    GetAllRunningSmuFeatures   = 0x54
+
     # Voltage readback
     GetSvi3Voltage             = 0x55
+
+    # Policy / power connector
+    UpdatePolicy               = 0x56
+    ExtPwrConnSupport          = 0x57
+    PreloadSwPstateForUclkOverDrive = 0x58
+
+    # FW Dstate
+    SetFwDstatesMask           = 0x39
 
 
 # Human-readable names for message IDs (for logging)
@@ -161,29 +190,32 @@ for _name in dir(PPSMC):
 # ---------------------------------------------------------------------------
 
 class PPCLK:
-    """Power Play clock domain identifiers."""
-    GFXCLK  = 0   # Graphics core clock
-    SOCCLK  = 1   # System-on-chip clock
-    UCLK    = 2   # Memory (unified) clock
-    FCLK    = 3   # Fabric / infinity fabric clock
-    DCLK0   = 4   # Video decode clock 0
-    VCLK0   = 5   # Video encode clock 0
-    DCLK1   = 6   # Video decode clock 1
-    VCLK1   = 7   # Video encode clock 1
-    DISPCLK = 8   # Display clock
-    DPPCLK  = 9   # Display pipe/plane clock
+    """Power Play clock domain identifiers (PPCLK_e from smu14_driver_if_v14_0.h)."""
+    GFXCLK   = 0   # Graphics core clock
+    SOCCLK   = 1   # System-on-chip clock
+    UCLK     = 2   # Memory (unified) clock
+    FCLK     = 3   # Fabric / infinity fabric clock
+    DCLK0    = 4   # Video decode clock 0
+    VCLK0    = 5   # Video encode clock 0
+    DISPCLK  = 6   # Display clock
+    DPPCLK   = 7   # Display pipe/plane clock
+    DPREFCLK = 8   # Display reference clock
+    DCFCLK   = 9   # Display controller fabric clock
+    DTBCLK   = 10  # Display transport block clock
+    COUNT    = 11
 
 _CLK_NAMES = {
-    PPCLK.GFXCLK:  "GFXCLK",
-    PPCLK.SOCCLK:  "SOCCLK",
-    PPCLK.UCLK:    "UCLK",
-    PPCLK.FCLK:    "FCLK",
-    PPCLK.DCLK0:   "DCLK0",
-    PPCLK.VCLK0:   "VCLK0",
-    PPCLK.DCLK1:   "DCLK1",
-    PPCLK.VCLK1:   "VCLK1",
-    PPCLK.DISPCLK: "DISPCLK",
-    PPCLK.DPPCLK:  "DPPCLK",
+    PPCLK.GFXCLK:   "GFXCLK",
+    PPCLK.SOCCLK:   "SOCCLK",
+    PPCLK.UCLK:     "UCLK",
+    PPCLK.FCLK:     "FCLK",
+    PPCLK.DCLK0:    "DCLK0",
+    PPCLK.VCLK0:    "VCLK0",
+    PPCLK.DISPCLK:  "DISPCLK",
+    PPCLK.DPPCLK:   "DPPCLK",
+    PPCLK.DPREFCLK: "DPREFCLK",
+    PPCLK.DCFCLK:   "DCFCLK",
+    PPCLK.DTBCLK:   "DTBCLK",
 }
 
 
@@ -192,47 +224,83 @@ _CLK_NAMES = {
 # ---------------------------------------------------------------------------
 
 class SMU_FEATURE:
-    """SMU feature bitmask positions (low 32-bit word)."""
-    # These are bit positions, not masks.  Use (1 << bit) to get the mask.
-    PPT                 = 0
-    TDC                 = 1
-    THERMAL             = 2
-    DS_GFXCLK           = 3   # Deep sleep for GFXCLK
-    DS_SOCCLK           = 4
-    DS_FCLK             = 5
-    DS_LCLK             = 6
-    DS_DCFCLK           = 7
-    DS_UCLK             = 8
-    GFX_ULV             = 9   # Ultra-low voltage for GFX
-    FW_DSTATE           = 10
-    GFXOFF              = 11  # Full GFX power off during idle
-    BACO                = 12
-    VCN_DPM             = 13
-    JPEG_DPM            = 14
-    USB_DPM             = 15
-    IPU_DPM             = 16
-    GFX_DPM             = 17  # GFX dynamic power management
-    GFX_IMU             = 18
-    MEM_DPM             = 19
-    SOC_MPCLK_DS        = 20
-    SOC_DPM             = 21
-    ISP_DPM             = 22
-    SOC_ULVMOS          = 23
-    FCLK_DPM            = 24
-    VPE_DPM             = 25
-    FW_CTF              = 26  # Firmware critical thermal fault (NEVER disable!)
-    VDDOFF              = 27
-    FAN_CONTROL         = 28
-    S0I3                = 29
-    LOW_POWER_DCNCLKS   = 30
-    ATHUB_PG            = 31
+    """SMU feature bitmask positions (from smu14_driver_if_v14_0.h FEATURE_*_BIT).
 
-_FEATURE_NAMES_LOW = {}
+    These are bit positions, not masks.  Use (1 << bit) to get the mask.
+    Full 64-bit bitmask: bits 0-31 = low word, bits 32-63 = high word.
+    """
+    # Low word (bits 0-31)
+    FW_DATA_READ              = 0
+    DPM_GFXCLK                = 1
+    DPM_GFX_POWER_OPTIMIZER   = 2
+    DPM_UCLK                  = 3
+    DPM_FCLK                  = 4
+    DPM_SOCCLK                = 5
+    DPM_LINK                  = 6
+    DPM_DCN                   = 7
+    VMEMP_SCALING             = 8
+    VDDIO_MEM_SCALING         = 9
+    DS_GFXCLK                 = 10
+    DS_SOCCLK                 = 11
+    DS_FCLK                   = 12
+    DS_LCLK                   = 13
+    DS_DCFCLK                 = 14
+    DS_UCLK                   = 15
+    GFX_ULV                   = 16
+    FW_DSTATE                 = 17
+    GFXOFF                    = 18
+    BACO                      = 19
+    MM_DPM                    = 20
+    SOC_MPCLK_DS              = 21
+    BACO_MPCLK_DS             = 22
+    THROTTLERS                = 23
+    SMARTSHIFT                = 24
+    GTHR                      = 25
+    ACDC                      = 26
+    VR0HOT                    = 27
+    FW_CTF                    = 28  # Firmware critical thermal fault (NEVER disable!)
+    FAN_CONTROL               = 29
+    GFX_DCS                   = 30
+    GFX_READ_MARGIN           = 31
+
+    # High word (bits 32-63)
+    LED_DISPLAY               = 32
+    GFXCLK_SPREAD_SPECTRUM    = 33
+    OUT_OF_BAND_MONITOR       = 34
+    OPTIMIZED_VMIN            = 35
+    GFX_IMU                   = 36
+    BOOT_TIME_CAL             = 37
+    GFX_PCC_DFLL              = 38
+    SOC_CG                    = 39
+    DF_CSTATE                 = 40
+    GFX_EDC                   = 41
+    BOOT_POWER_OPT            = 42
+    CLOCK_POWER_DOWN_BYPASS   = 43
+    DS_VCN                    = 44
+    BACO_CG                   = 45
+    MEM_TEMP_READ             = 46
+    ATHUB_MMHUB_PG            = 47
+    SOC_PCC                   = 48
+    EDC_PWRBRK                = 49
+    SOC_EDC_XVMIN             = 50
+    GFX_PSM_DIDT              = 51
+    APT_ALL_ENABLE            = 52
+    APT_SQ_THROTTLE           = 53
+    APT_PF_DCS                = 54
+    GFX_EDC_XVMIN             = 55
+    GFX_DIDT_XVMIN            = 56
+    FAN_ABNORMAL              = 57
+    CLOCK_STRETCH_COMPENSATOR = 58
+
+_FEATURE_NAMES = {}
 for _name in dir(SMU_FEATURE):
     if not _name.startswith("_"):
         _val = getattr(SMU_FEATURE, _name)
         if isinstance(_val, int):
-            _FEATURE_NAMES_LOW[_val] = _name
+            _FEATURE_NAMES[_val] = _name
+
+# Backward-compat alias
+_FEATURE_NAMES_LOW = _FEATURE_NAMES
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +365,11 @@ class SmuCmd:
         msg_name = _MSG_NAMES.get(msg_id, f"0x{msg_id:02X}")
         self._msg_count += 1
 
+        try:
+            _smu_log.info(f"[SMU] #{self._msg_count} SEND {msg_name} msg=0x{msg_id:02X} param=0x{param:08X}")
+        except Exception:
+            pass
+
         if self._verbose:
             print(f"[SMU] #{self._msg_count} {msg_name}"
                   f" (msg=0x{msg_id:02X}, param=0x{param:08X})")
@@ -326,6 +399,10 @@ class SmuCmd:
             poll_interval = min(poll_interval * 1.5, max_interval)
 
         if resp == SMU_RESP_NONE:
+            try:
+                _smu_log.warning(f"[SMU] #{self._msg_count} TIMEOUT after {timeout_ms}ms waiting for {msg_name}")
+            except Exception:
+                pass
             if self._verbose:
                 print(f"[SMU] TIMEOUT after {timeout_ms}ms waiting for response"
                       f" to {msg_name}")
@@ -338,6 +415,11 @@ class SmuCmd:
         return_value = mmio.smn_read32(SMN_C2PMSG_PARAM)
 
         resp_name = _RESP_NAMES.get(resp, f"0x{resp:02X}")
+        try:
+            _smu_log.info(f"[SMU] #{self._msg_count} RESP {resp_name} (0x{resp:02X}) return=0x{return_value:08X}")
+        except Exception:
+            pass
+
         if self._verbose:
             if resp == SMU_RESP_OK:
                 print(f"[SMU]   -> {resp_name}, return=0x{return_value:08X}")
@@ -430,7 +512,6 @@ class SmuCmd:
             64-bit bitmask (low | high << 32).
         """
         low = self.send_msg_ok(PPSMC.GetRunningSmuFeaturesLow)
-        # High word -- may fail on some FW versions
         try:
             high = self.send_msg_ok(PPSMC.GetRunningSmuFeaturesHigh)
         except (RuntimeError, TimeoutError):
@@ -445,18 +526,20 @@ class SmuCmd:
             bitmask: 64-bit feature bitmask from get_running_features().
 
         Returns:
-            List of (bit_position, feature_name, enabled) tuples.
+            List of (bit_position, feature_name, enabled) tuples for enabled bits.
         """
         result = []
         for bit in range(64):
             enabled = bool(bitmask & (1 << bit))
-            if bit < 32:
-                name = _FEATURE_NAMES_LOW.get(bit, f"BIT_{bit}")
-            else:
-                name = f"HIGH_BIT_{bit - 32}"
+            name = _FEATURE_NAMES.get(bit, f"BIT_{bit}")
             if enabled:
                 result.append((bit, name, True))
         return result
+
+    def get_dc_mode_max_freq(self, clk_id):
+        """Query maximum DPM frequency in DC power mode for a clock domain."""
+        param = (clk_id & 0xFFFF) << 16
+        return self.send_msg_ok(PPSMC.GetDcModeMaxDpmFreq, param)
 
     # ---- Clock / power control helpers ----
 
@@ -542,6 +625,16 @@ class SmuCmd:
             bitmask: Bits to enable
         """
         return self.send_msg_ok(PPSMC.EnableSmuFeaturesLow,
+                                bitmask & 0xFFFFFFFF)
+
+    def disable_features_high(self, bitmask):
+        """Disable SMU features by bitmask (high 32 bits, bits 32-63)."""
+        return self.send_msg_ok(PPSMC.DisableSmuFeaturesHigh,
+                                bitmask & 0xFFFFFFFF)
+
+    def enable_features_high(self, bitmask):
+        """Enable SMU features by bitmask (high 32 bits, bits 32-63)."""
+        return self.send_msg_ok(PPSMC.EnableSmuFeaturesHigh,
                                 bitmask & 0xFFFFFFFF)
 
     # ---- Workload profile ----

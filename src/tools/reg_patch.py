@@ -15,14 +15,30 @@ Values patched:
   - KMD_EnableContextBasedPowerManagement   -> 0  (disable context-based PM)
   - EnableAspmL0s                           -> 0  (disable PCIe ASPM L0s)
   - EnableAspmL1                            -> 0  (disable PCIe ASPM L1)
-  - PP_ULPSDelayIntervalInMilliSeconds      -> 0  (zero ULPS delay)
+  - PP_ULPSDelayIntervalInMilliSeconds     -> 0  (zero ULPS delay)
   - DisableVCEPowerGating                   -> 1  (disable VCE power gating)
+  - PP_DisablePowerContainment              -> 1  (benchmark: no boost capping)
+  - PP_DisableClockStretcher                -> 1  (benchmark: no mid-load drops)
+  - PP_MCLKDeepSleepDisable                 -> 1  (benchmark: mem clock stays high)
+  - KMD_EnableGFXLowPowerState              -> 0  (benchmark: GFX low power off)
+  - DisableDrmdmaPowerGating                -> 1  (benchmark: DRM/DMA gating off)
 
 Already-good values are verified and reported but not changed:
   - PP_SclkDeepSleepDisable                 == 1
   - PP_DisableVoltageIsland                 == 1
   - DisableSAMUPowerGating                  == 1
   - GCOOPTION_DisableGPIOPowerSaveMode      == 1
+
+Extra tunable values (read but not auto-patched; user controls via UI):
+  - PP_ThermalAutoThrottlingEnable          (0/1, default driver value)
+  - KMD_FRTEnabled                          (0/1, Frame Rate Target Control)
+  - DisableFBCSupport                       (0/1, Frame Buffer Compression)
+  - DMMEnableDDCPolling                     (0/1, DDC polling)
+  - StutterMode                             (0-2, memory stutter mode)
+  - PP_MCLKStutterModeThreshold             (ms, stutter delay threshold)
+  - PP_ActivityTarget                       (%, DPM upclocking aggressiveness)
+  - PP_AllGraphicLevel_UpHyst               (ms, clock upshift delay)
+  - PP_AllGraphicLevel_DownHyst             (ms, clock downshift delay)
 
 Usage (standalone):
   py reg_patch.py                # Show current values (dry-run)
@@ -80,6 +96,12 @@ PATCH_VALUES: List[Tuple[str, int, str]] = [
     ("EnableAspmL1",                          0, "PCIe ASPM L1 link power saving"),
     ("PP_ULPSDelayIntervalInMilliSeconds",    0, "ULPS delay interval"),
     ("DisableVCEPowerGating",                 1, "VCE power gating (1=disabled)"),
+    # Benchmark ramp-up: start from highest clocks (3DMark, etc.)
+    ("PP_DisablePowerContainment",            1, "Power containment (1=disabled, no boost capping)"),
+    ("PP_DisableClockStretcher",             1, "Clock stretcher (1=disabled, no mid-load drops)"),
+    ("PP_MCLKDeepSleepDisable",              1, "Memory clock deep sleep (1=disabled)"),
+    ("KMD_EnableGFXLowPowerState",           0, "GFX low power state (0=disabled)"),
+    ("DisableDrmdmaPowerGating",             1, "DRM/DMA power gating (1=disabled)"),
 ]
 
 # Values we verify are already correct (name, expected_value, description).
@@ -90,7 +112,23 @@ VERIFY_VALUES: List[Tuple[str, int, str]] = [
     ("GCOOPTION_DisableGPIOPowerSaveMode", 1, "GPIO power-save mode disabled"),
 ]
 
+# Additional performance/display tuning values (not part of anti-clock-gating).
+# NOT included in RECOMMENDED_VALUES — Custom column defaults to current registry value.
+# Format: (name, description, is_boolean, min_val, max_val)
+EXTRA_VALUES: List[Tuple[str, str, bool, int, int]] = [
+    ("PP_ThermalAutoThrottlingEnable", "Thermal auto-throttling",              True,  0, 1),
+    ("KMD_FRTEnabled",                 "Frame Rate Target Control",            True,  0, 1),
+    ("DisableFBCSupport",              "Frame Buffer Compression (1=disabled)", True, 0, 1),
+    ("DMMEnableDDCPolling",            "DDC monitor polling",                  True,  0, 1),
+    ("StutterMode",                    "Memory clock stutter mode (0=OFF)",    False, 0, 2),
+    ("PP_MCLKStutterModeThreshold",    "MCLK stutter delay threshold",        False, 0, 131072),
+    ("PP_ActivityTarget",              "DPM upclocking aggressiveness (%)",    False, 0, 100),
+    ("PP_AllGraphicLevel_UpHyst",      "Clock upshift delay (ms, 0=immediate)", False, 0, 500),
+    ("PP_AllGraphicLevel_DownHyst",    "Clock downshift delay (ms)",           False, 0, 500),
+]
+
 # Recommended values for UI "Select recommended" (name -> target value).
+# Only PATCH and VERIFY values are included; EXTRA values are left at current.
 RECOMMENDED_VALUES: Dict[str, int] = {}
 for _n, _v, _ in PATCH_VALUES:
     RECOMMENDED_VALUES[_n] = _v
@@ -102,6 +140,8 @@ REG_NAME_TO_DISPLAY: Dict[str, str] = {}
 for _n, _, _d in PATCH_VALUES:
     REG_NAME_TO_DISPLAY[_n] = _d
 for _n, _, _d in VERIFY_VALUES:
+    REG_NAME_TO_DISPLAY[_n] = _d
+for _n, _d, _, _, _ in EXTRA_VALUES:
     REG_NAME_TO_DISPLAY[_n] = _d
 
 
@@ -243,11 +283,13 @@ class RegistryPatch:
         Read all patch-relevant values from the registry.
 
         Returns:
-            Dict with two sub-dicts:
+            Dict with three sub-dicts:
               "patch":  {name: {"current": val, "target": val, "desc": str}, ...}
               "verify": {name: {"current": val, "expected": val, "desc": str}, ...}
+              "extra":  {name: {"current": val, "desc": str, "is_bool": bool,
+                                "min": int, "max": int}, ...}
         """
-        result: Dict[str, Dict[str, Any]] = {"patch": {}, "verify": {}}
+        result: Dict[str, Dict[str, Any]] = {"patch": {}, "verify": {}, "extra": {}}
 
         with winreg.OpenKey(
             winreg.HKEY_LOCAL_MACHINE, self.key_path, 0, winreg.KEY_READ
@@ -266,6 +308,16 @@ class RegistryPatch:
                     "current": current,
                     "expected": expected,
                     "desc": desc,
+                }
+
+            for name, desc, is_bool, min_val, max_val in EXTRA_VALUES:
+                current = _read_dword(k, name)
+                result["extra"][name] = {
+                    "current": current,
+                    "desc": desc,
+                    "is_bool": is_bool,
+                    "min": min_val,
+                    "max": max_val,
                 }
 
         return result
@@ -319,7 +371,7 @@ class RegistryPatch:
         Returns:
             List of (name, old_value, new_value) for each changed entry.
         """
-        # Read originals first (for backup) — include both PATCH and VERIFY values
+        # Read originals first (for backup) — include PATCH, VERIFY, and EXTRA values
         originals: Dict[str, Optional[int]] = {}
         with winreg.OpenKey(
             winreg.HKEY_LOCAL_MACHINE, self.key_path, 0, winreg.KEY_READ
@@ -328,12 +380,18 @@ class RegistryPatch:
                 originals[name] = _read_dword(k, name)
             for name, expected, desc in VERIFY_VALUES:
                 originals[name] = _read_dword(k, name)
+            for name, desc, is_bool, min_val, max_val in EXTRA_VALUES:
+                originals[name] = _read_dword(k, name)
 
         if not dry_run and not os.path.isfile(BACKUP_FILE):
             self._save_backup(originals)
 
         # Build (name, target) list: use values dict if provided, else PATCH_VALUES
-        all_names = {n for n, _, _ in PATCH_VALUES} | {n for n, _, _ in VERIFY_VALUES}
+        all_names = (
+            {n for n, _, _ in PATCH_VALUES}
+            | {n for n, _, _ in VERIFY_VALUES}
+            | {n for n, _, _, _, _ in EXTRA_VALUES}
+        )
         if values is not None:
             items_to_patch = [(n, v) for n, v in values.items() if n in all_names]
         else:

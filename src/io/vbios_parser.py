@@ -100,6 +100,13 @@ class VbiosValues:
     rom_offset: int = 0
     rom_path:   str = ""
 
+    # Immutable PP table header fingerprint for memory scanning.
+    # Extracted from golden_pp_id through thermal_controller_type — these
+    # never change regardless of driver clock/power patching.
+    pp_fingerprint: bytes = b''
+    fingerprint_to_clocks: int = 0   # byte offset from fingerprint match -> BaseClockAc
+    baseclock_pp_offset: int = 0     # absolute byte offset of BaseClockAc within PP table
+
     def clock_pattern(self) -> bytes:
         return struct.pack("<3H", self.baseclock_ac, self.gameclock_ac, self.boostclock_ac)
 
@@ -113,6 +120,26 @@ class VbiosValues:
             f"PPT: {self.power_ac}W  "
             f"TDC: GFX={self.tdc_gfx}A SOC={self.tdc_soc}A"
         )
+
+
+@dataclass
+class DecodedPPTable:
+    """Full UPP-decoded PP table with metadata.
+
+    ``data`` is the complete OrderedDict tree produced by
+    ``upp.decode.build_data_tree``.  Each leaf is a dict with keys
+    ``value``, ``offset`` (relative to the start of the PP table binary),
+    and ``type`` (struct format character).
+
+    ``pp_offset`` is the absolute byte offset of the PP table within the
+    ROM image, so absolute ROM offset = pp_offset + leaf['offset'].
+    """
+
+    data:       Dict
+    pp_offset:  int
+    pp_length:  int
+    pp_bytes:   bytearray
+    rom_path:   str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +204,13 @@ def _parse_vbios_upp_bytes(
             res = _upp_decode.get_value(None, normalized, data_dict=data)
             return int(res["value"]) if res and "value" in res else None
 
+        def _get_info(path: str) -> Optional[dict]:
+            """Return full UPP field descriptor (value, offset, type)."""
+            parts = path.strip("/").split("/")
+            normalized = [int(p) if p.isdigit() else p for p in parts]
+            res = _upp_decode.get_value(None, normalized, data_dict=data)
+            return res if res and "value" in res else None
+
         base = _get("smc_pptable/SkuTable/DriverReportedClocks/BaseClockAc")
         game = _get("smc_pptable/SkuTable/DriverReportedClocks/GameClockAc")
         boost = _get("smc_pptable/SkuTable/DriverReportedClocks/BoostClockAc")
@@ -201,9 +235,33 @@ def _parse_vbios_upp_bytes(
         if power_ac is None or tdc_gfx is None:
             return None
 
+        # -- Extract immutable fingerprint for memory scanning --
+        # Use bytes from golden_pp_id through thermal_controller_type.
+        # These are hardware identifiers that never change during patching.
+        pp_fp = b''
+        fp_to_clk = 0
+        bc_pp_off = 0
+        try:
+            gp_info = _get_info("golden_pp_id")
+            tc_info = _get_info("thermal_controller_type")
+            bc_info = _get_info("smc_pptable/SkuTable/DriverReportedClocks/BaseClockAc")
+            if gp_info and tc_info and bc_info:
+                bc_pp_off = bc_info["offset"]
+                fp_start = gp_info["offset"]
+                fp_end = tc_info["offset"] + 1  # thermal_controller_type is 1 byte
+                if 0 <= fp_start < fp_end <= len(pp_tbl):
+                    pp_fp = bytes(pp_tbl[fp_start:fp_end])
+                    fp_to_clk = bc_pp_off - fp_start
+        except Exception:
+            pass
+
         if diagnostic_out is not None:
             diagnostic_out.append(f"  Parsed via upp (PP table at 0x{pp_offset:04X}, {pp_len} bytes)")
             diagnostic_out.append(f"  => {base}/{game}/{boost} MHz  PPT={power_ac}W  TDC={tdc_gfx}A")
+            if pp_fp:
+                diagnostic_out.append(
+                    f"  Fingerprint: {len(pp_fp)} bytes at PP+0x{gp_info['offset']:X}, "
+                    f"clocks at +{fp_to_clk}")
 
         return VbiosValues(
             baseclock_ac=base or 0,
@@ -224,6 +282,9 @@ def _parse_vbios_upp_bytes(
             temp_vr_soc=temp_vr_soc or 0,
             rom_offset=pp_offset,
             rom_path=rom_path,
+            pp_fingerprint=pp_fp,
+            fingerprint_to_clocks=fp_to_clk,
+            baseclock_pp_offset=bc_pp_off,
         )
     except Exception:
         return None
@@ -242,6 +303,162 @@ def _parse_vbios_upp(
     except OSError:
         return None
     return _parse_vbios_upp_bytes(rom_bytes, rom_path, diagnostic_out)
+
+
+# ---------------------------------------------------------------------------
+# Full PP table decode (returns the entire UPP data tree)
+# ---------------------------------------------------------------------------
+
+def decode_pp_table_full(
+    rom_bytes: bytes,
+    rom_path: str = "",
+) -> Optional[DecodedPPTable]:
+    """Decode the full PP table from a VBIOS ROM into an OrderedDict tree.
+
+    Returns a ``DecodedPPTable`` containing every field that UPP can parse
+    (SkuTable, CustomSkuTable, BoardTable, DriverReportedClocks, MsgLimits,
+    frequency arrays, fan curves, voltage tables, etc.).
+
+    Returns ``None`` when UPP is unavailable or the ROM doesn't contain a
+    recognisable RDNA3/4 PP table.
+    """
+    if not _UPP_AVAILABLE:
+        return None
+
+    result = _get_pp_table_offset_rdna(rom_bytes)
+    if result is None:
+        return None
+
+    pp_offset, pp_len = result
+    pp_tbl = bytearray(rom_bytes[pp_offset:pp_offset + pp_len])
+
+    try:
+        data = _upp_decode.select_pp_struct(pp_tbl, rawdump=False, debug=False)
+    except Exception:
+        return None
+
+    if data is None:
+        return None
+
+    return DecodedPPTable(
+        data=data,
+        pp_offset=pp_offset,
+        pp_length=pp_len,
+        pp_bytes=pp_tbl,
+        rom_path=rom_path,
+    )
+
+
+def decode_pp_table_full_from_file(
+    rom_path: str,
+) -> Optional[DecodedPPTable]:
+    """Convenience wrapper: reads a VBIOS ROM file and returns the full decode."""
+    try:
+        with open(rom_path, "rb") as f:
+            rom_bytes = f.read()
+    except OSError:
+        return None
+    return decode_pp_table_full(rom_bytes, rom_path)
+
+
+# ---------------------------------------------------------------------------
+# OD limits from PPTable (OverDriveLimitsBasicMin/Max)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class OdLimits:
+    """OD parameter limits from PPTable SkuTable.OverDriveLimitsBasicMin/Max.
+
+    Used to restrict user input to SMU-allowed ranges and to show which
+    features are supported (FeatureCtrlMask in OverDriveLimitsBasicMax).
+    """
+    feature_ctrl_mask: int  # From OverDriveLimitsBasicMax; bit N = feature N allowed
+    limits: Dict[str, Tuple[int, int]]  # key -> (min, max) from BasicMin/BasicMax
+
+    def is_allowed(self, feature_bit: int) -> bool:
+        """True if the OD feature bit is set in FeatureCtrlMask."""
+        return bool(self.feature_ctrl_mask & (1 << feature_bit))
+
+    def get_range(self, key: str) -> Optional[Tuple[int, int]]:
+        """Return (min, max) for key, or None if not in limits."""
+        return self.limits.get(key)
+
+
+def extract_od_limits_from_decoded(decoded: Optional[DecodedPPTable]) -> Optional[OdLimits]:
+    """Extract OverDriveLimitsBasicMin/Max from decoded PP table.
+
+    Returns OdLimits with feature_ctrl_mask and per-field min/max ranges.
+    Returns None when decoded is None or OverDriveLimits are not present
+    (e.g. non-RDNA4 VBIOS).
+    """
+    if decoded is None or not _UPP_AVAILABLE:
+        return None
+
+    data = decoded.data
+    if data is None:
+        return None
+
+    def _get(path: str) -> Optional[int]:
+        parts = path.strip("/").split("/")
+        normalized = [int(p) if p.isdigit() else p for p in parts]
+        try:
+            res = _upp_decode.get_value(None, normalized, data_dict=data)
+            return int(res["value"]) if res and "value" in res else None
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    # Try RDNA4 layout (OverDriveLimitsBasicMin/Max)
+    fcm = _get("smc_pptable/SkuTable/OverDriveLimitsBasicMax/FeatureCtrlMask")
+    if fcm is None:
+        # Try RDNA3 layout (OverDriveLimitsMin, OverDriveLimitsBasicMax)
+        fcm = _get("smc_pptable/SkuTable/OverDriveLimitsBasicMax/FeatureCtrlMask")
+    if fcm is None:
+        return None
+
+    def _lim(field: str) -> Optional[Tuple[int, int]]:
+        min_val = _get(f"smc_pptable/SkuTable/OverDriveLimitsBasicMin/{field}")
+        max_val = _get(f"smc_pptable/SkuTable/OverDriveLimitsBasicMax/{field}")
+        if min_val is None or max_val is None:
+            min_val = _get(f"smc_pptable/SkuTable/OverDriveLimitsMin/{field}")
+            max_val = _get(f"smc_pptable/SkuTable/OverDriveLimitsBasicMax/{field}")
+        if min_val is not None and max_val is not None:
+            return (min_val, max_val)
+        return None
+
+    limits: Dict[str, Tuple[int, int]] = {}
+    for field in (
+        "GfxclkFoffset", "Ppt", "Tdc",
+        "UclkFmin", "UclkFmax", "FclkFmin", "FclkFmax",
+        "VddGfxVmax", "VddSocVmax",
+        "FanTargetTemperature", "FanMinimumPwm", "MaxOpTemp",
+        "AcousticTargetRpmThreshold", "AcousticLimitRpmThreshold",
+        "FanZeroRpmEnable", "GfxEdc", "GfxPccLimitControl",
+    ):
+        r = _lim(field)
+        if r is not None:
+            limits[field] = r
+
+    # VoltageOffsetPerZoneBoundary: use index 0 for range (Linux does this)
+    vo_min = _get("smc_pptable/SkuTable/OverDriveLimitsBasicMin/VoltageOffsetPerZoneBoundary/0")
+    vo_max = _get("smc_pptable/SkuTable/OverDriveLimitsBasicMax/VoltageOffsetPerZoneBoundary/0")
+    if vo_min is None:
+        vo_min = _get("smc_pptable/SkuTable/OverDriveLimitsMin/VoltageOffsetPerZoneBoundary/0")
+    if vo_max is None:
+        vo_max = _get("smc_pptable/SkuTable/OverDriveLimitsBasicMax/VoltageOffsetPerZoneBoundary/0")
+    if vo_min is not None and vo_max is not None:
+        limits["VoltageOffsetPerZoneBoundary"] = (vo_min, vo_max)
+
+    # Fan curve points: use index 0
+    fp_min = _get("smc_pptable/SkuTable/OverDriveLimitsBasicMin/FanLinearPwmPoints/0")
+    fp_max = _get("smc_pptable/SkuTable/OverDriveLimitsBasicMax/FanLinearPwmPoints/0")
+    if fp_min is not None and fp_max is not None:
+        limits["FanLinearPwmPoints"] = (fp_min, fp_max)
+    ft_min = _get("smc_pptable/SkuTable/OverDriveLimitsBasicMin/FanLinearTempPoints/0")
+    ft_max = _get("smc_pptable/SkuTable/OverDriveLimitsBasicMax/FanLinearTempPoints/0")
+    if ft_min is not None and ft_max is not None:
+        limits["FanLinearTempPoints"] = (ft_min, ft_max)
+
+    return OdLimits(feature_ctrl_mask=fcm, limits=limits)
 
 
 # ---------------------------------------------------------------------------
