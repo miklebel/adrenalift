@@ -120,7 +120,7 @@ EXTRA_VALUES: List[Tuple[str, str, bool, int, int]] = [
     ("KMD_FRTEnabled",                 "Frame Rate Target Control",            True,  0, 1),
     ("DisableFBCSupport",              "Frame Buffer Compression (1=disabled)", True, 0, 1),
     ("DMMEnableDDCPolling",            "DDC monitor polling",                  True,  0, 1),
-    ("StutterMode",                    "Memory clock stutter mode (0=OFF)",    False, 0, 2),
+    ("StutterMode",                    "Memory clock stutter mode (0=OFF)",    False, 0, 0xFFFF),
     ("PP_MCLKStutterModeThreshold",    "MCLK stutter delay threshold",        False, 0, 131072),
     ("PP_ActivityTarget",              "DPM upclocking aggressiveness (%)",    False, 0, 100),
     ("PP_AllGraphicLevel_UpHyst",      "Clock upshift delay (ms, 0=immediate)", False, 0, 500),

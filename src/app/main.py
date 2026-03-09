@@ -4,19 +4,22 @@ RDNA4 Overclock GUI -- PySide6 Main Window
 
 Main application window with:
   - VBIOS gate screen: file picker + copy to bios/ when no VBIOS present
-  - Main overclock UI: Simple Settings, PP, OD, SMU tabs, Memory, Registry Patch, log panel, Apply button
+  - Main overclock UI: Simple Settings, PP, SMU (with OD sub-tab), Memory, Registry Patch, log panel, Apply button
 """
 
 from __future__ import annotations
 
+import atexit
+import faulthandler
 import logging
 import os
 import sys
+import threading
 import time
 import traceback
 from collections import Counter
 
-from PySide6.QtCore import Qt, QSize, QThread, QTimer, Signal
+from PySide6.QtCore import Qt, QSize, QThread, QTimer, Signal, QtMsgType, qInstallMessageHandler
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -66,11 +69,20 @@ _file_logger.addHandler(_fh)
 _file_logger.info("=" * 60)
 _file_logger.info("Session started")
 
+# Enable faulthandler so native crashes (SIGSEGV, SIGABRT, etc.) dump a
+# traceback to the log file instead of vanishing silently.
+try:
+    _fault_fh = open(_LOG_FILE, "a", encoding="utf-8")
+    faulthandler.enable(file=_fault_fh, all_threads=True)
+except Exception:
+    faulthandler.enable(all_threads=True)
+
 
 def _log_to_file(msg: str):
     """Write a single log line to the persistent log file."""
     try:
         _file_logger.info(msg)
+        _fh.flush()
     except Exception:
         pass
 
@@ -80,6 +92,7 @@ def _log_exception_to_file(context: str = ""):
     try:
         tb = traceback.format_exc()
         _file_logger.error(f"EXCEPTION ({context}):\n{tb}")
+        _fh.flush()
     except Exception:
         pass
 
@@ -100,6 +113,59 @@ def _install_global_exception_hook():
     sys.excepthook = _hook
 
 _install_global_exception_hook()
+
+
+def _install_threading_exception_hook():
+    """Catch unhandled exceptions on non-main threads (Python 3.8+)."""
+    def _thread_hook(args):
+        try:
+            tb_text = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+            _file_logger.critical(
+                f"UNHANDLED THREAD EXCEPTION (thread={args.thread}):\n{tb_text}"
+            )
+            _fh.flush()
+        except Exception:
+            pass
+    threading.excepthook = _thread_hook
+
+_install_threading_exception_hook()
+
+
+def _install_qt_message_handler():
+    """Redirect Qt internal warnings/errors to the log file."""
+    _msg_type_names = {
+        QtMsgType.QtDebugMsg: "QtDebug",
+        QtMsgType.QtInfoMsg: "QtInfo",
+        QtMsgType.QtWarningMsg: "QtWarning",
+        QtMsgType.QtCriticalMsg: "QtCritical",
+        QtMsgType.QtFatalMsg: "QtFatal",
+    }
+    def _handler(msg_type, context, message):
+        label = _msg_type_names.get(msg_type, f"Qt({msg_type})")
+        loc = ""
+        if context.file:
+            loc = f" [{context.file}:{context.line}]"
+        try:
+            _file_logger.warning(f"{label}{loc}: {message}")
+            if msg_type in (QtMsgType.QtCriticalMsg, QtMsgType.QtFatalMsg):
+                _fh.flush()
+        except Exception:
+            pass
+    qInstallMessageHandler(_handler)
+
+_install_qt_message_handler()
+
+
+_atexit_clean = False
+
+def _atexit_handler():
+    if _atexit_clean:
+        _file_logger.info("Session ended (clean exit)")
+    else:
+        _file_logger.critical("Session ended (atexit without clean flag — possible crash or kill)")
+    _fh.flush()
+
+atexit.register(_atexit_handler)
 
 
 from src.io.vbios_parser import (
@@ -131,6 +197,7 @@ except (ImportError, RuntimeError):
     RECOMMENDED_VALUES = {}
     REG_NAME_TO_DISPLAY = {}
     BACKUP_FILE = None
+
 from src.engine.overclock_engine import (
     OverclockSettings,
     ScanOptions,
@@ -150,18 +217,13 @@ from src.engine.overclock_engine import (
     read_pptable_at_addr,
     is_valid_pptable,
     read_u16,
-    read_ecc_info_from_hw,
     read_smu_metrics_full,
     read_smu_table_raw,
-)
-from src.engine.ecc import (
-    EccAccumulator, format_ecc_summary, total_ce_count, format_raw_hex,
-    detect_test_pattern,
 )
 from src.engine.smu import PPSMC, PPCLK, SMU_FEATURE, _CLK_NAMES, _FEATURE_NAMES, _FEATURE_NAMES_LOW
 from src.engine.smu_metrics import (
     PPCLK_NAMES, SVI_PLANE_NAMES, TEMP_NAMES, THROTTLER_COUNT,
-    D3HOT_SEQUENCE_NAMES,
+    THROTTLER_NAMES, D3HOT_SEQUENCE_NAMES,
 )
 from src.engine.od_table import (
     TABLE_PPTABLE,
@@ -205,7 +267,7 @@ _METRICS_DISPLAY_SECTIONS = [
     ("Temperature", [f"AvgTemperature_{n}" for n in TEMP_NAMES]
      + ["AvgTemperatureFanIntake"]),
     ("PCIe", ["PcieRate", "PcieWidth"]),
-    ("Throttling (%)", [f"ThrottlingPercentage_{i}" for i in range(THROTTLER_COUNT)]
+    ("Throttling (%)", [f"Throttle_{THROTTLER_NAMES[i]}" for i in range(THROTTLER_COUNT)]
      + ["VmaxThrottlingPercentage"]),
     ("Average Frequencies (MHz)", [
         "AverageGfxclkFrequencyTarget",
@@ -456,61 +518,6 @@ class MemoryRefreshWorker(QThread):
 # ---------------------------------------------------------------------------
 # Detailed Tab Refresh Worker
 # ---------------------------------------------------------------------------
-
-
-class SmuTricksRefreshWorker(QThread):
-    """Background worker to read GFXCLK DPM frequency limits from SMU."""
-
-    results_signal = Signal(object)  # dict with min/max or error
-
-    def run(self):
-        hw = None
-        _log_to_file("SmuTricksRefreshWorker: starting")
-        try:
-            hw = init_hardware()
-            smu = hw["smu"]
-            dpm_min = smu.get_min_freq(PPCLK.GFXCLK)
-            dpm_max = smu.get_max_freq(PPCLK.GFXCLK)
-            self.results_signal.emit({"min": dpm_min, "max": dpm_max})
-        except Exception as e:
-            _log_exception_to_file("SmuTricksRefreshWorker")
-            self.results_signal.emit({"error": str(e)})
-        finally:
-            if hw:
-                try:
-                    cleanup_hardware(hw)
-                except Exception:
-                    pass
-        _log_to_file("SmuTricksRefreshWorker: done")
-
-
-class EccRefreshWorker(QThread):
-    """Background worker to read ECC counters from SMU."""
-
-    results_signal = Signal(object)  # (ecc_table, raw_bytes) or {"error": str}
-
-    def run(self):
-        hw = None
-        _log_to_file("EccRefreshWorker: starting")
-        try:
-            hw = init_hardware()
-            ecc_table, raw_bytes = read_ecc_info_from_hw(hw)
-            if raw_bytes:
-                from src.engine.ecc import format_raw_hex
-                _log_to_file(f"ECC raw hex (first 128 bytes):\n{format_raw_hex(raw_bytes[:128])}")
-            else:
-                _log_to_file("ECC: no data returned (transfer failed or unsupported)")
-            self.results_signal.emit((ecc_table, raw_bytes))
-        except Exception as e:
-            _log_exception_to_file("EccRefreshWorker")
-            self.results_signal.emit({"error": str(e)})
-        finally:
-            if hw:
-                try:
-                    cleanup_hardware(hw)
-                except Exception:
-                    pass
-        _log_to_file("EccRefreshWorker: done")
 
 
 class MetricsRefreshWorker(QThread):
@@ -775,25 +782,17 @@ class MainOverclockWidget(QWidget):
         self.tabs = QTabWidget()
         self.simple_tab = QWidget()
         self.pp_tab = QWidget()
-        self.od_tab = QWidget()
         self.smu_tab = QWidget()
-        self.smu_tricks_tab = QWidget()
-        self.ecc_tab = QWidget()
         self.memory_tab = QWidget()
         self.registry_tab = QWidget()
         self._setup_simple_tab()
         self._setup_detailed_tabs()
         self._setup_smu_tab()
-        self._setup_smu_tricks_tab()
-        self._setup_ecc_tab()
         self._setup_memory_tab()
         self._setup_registry_tab()
         self.tabs.addTab(self.simple_tab, "Simple Settings")
         self.tabs.addTab(self.pp_tab, "PP")
-        self.tabs.addTab(self.od_tab, "OD")
         self.tabs.addTab(self.smu_tab, "SMU")
-        self.tabs.addTab(self.smu_tricks_tab, "SMU Tricks")
-        self.tabs.addTab(self.ecc_tab, "ECC")
         self.tabs.addTab(self.memory_tab, "Memory")
         self.tabs.addTab(self.registry_tab, "Registry Patch")
         layout.addWidget(self.tabs)
@@ -1221,7 +1220,7 @@ rather than <i>against</i> you. Both are needed for a robust overclock.</p>
         self.rescan_btn.setEnabled(True)
 
     def _setup_detailed_tabs(self):
-        """Set up PP, OD, SMU as separate tabs."""
+        """Set up PP tab and OD sub-tab (OD is added to SMU inner tabs)."""
         vb = self.vbios_values
 
         # Param definitions: (human_name, table_key, source, unit, vbios_val, ram_key, smu_key)
@@ -1247,39 +1246,6 @@ rather than <i>against</i> you. Both are needed for a robust overclock.</p>
             self._param_current_value_widget[key] = cv_label
             self._param_unit[key] = f" {unit}" if unit else ""
             self._detailed_param_widgets[key] = widget
-
-        def _add_od_row(table, human, key, unit, vb_val, smu_key, widget, row_apply_fn=None,
-                       feature_bit=None, limits_key=None):
-            row = table.rowCount()
-            table.insertRow(row)
-            table.setItem(row, 0, QTableWidgetItem(human))
-            table.setItem(row, 1, QTableWidgetItem(key))
-            table.setItem(row, 2, QTableWidgetItem(unit))
-            allowed_str = "—"
-            if od_limits is not None and feature_bit is not None:
-                allowed_str = "Yes" if od_limits.is_allowed(feature_bit) else "No"
-            table.setItem(row, 3, QTableWidgetItem(allowed_str))
-            cv_label = QLabel("—")
-            table.setCellWidget(row, 4, cv_label)
-            table.setCellWidget(row, 5, widget)
-            self._param_smu_key[key] = smu_key
-            self._param_current_value_widget[key] = cv_label
-            self._param_unit[key] = f" {unit}" if unit else ""
-            self._detailed_param_widgets[key] = widget
-            # Apply PPTable limits to spinbox range
-            if od_limits is not None:
-                lk = limits_key if limits_key is not None else key
-                rng = od_limits.get_range(lk)
-                if rng is not None:
-                    widget.setRange(rng[0], rng[1])
-            if row_apply_fn is not None:
-                btn = QPushButton("Set")
-                btn.setMaximumWidth(50)
-                _label = human
-                _fn = row_apply_fn
-                btn.clicked.connect(lambda checked=False, fn=_fn, lbl=_label:
-                                    self._run_with_hardware(f"Set {lbl}", fn, require_scan=False))
-                table.setCellWidget(row, 6, btn)
 
         def _add_smu_row(table, human, key, unit, vb_val, widget, smu_key=None, row_apply_fn=None):
             row = table.rowCount()
@@ -1596,21 +1562,164 @@ rather than <i>against</i> you. Both are needed for a robust overclock.</p>
         pp_scroll.setWidgetResizable(True)
         pp_scroll.setWidget(pp_grp)
         pp_tab_layout = QVBoxLayout(self.pp_tab)
+        pp_hint_btn = QToolButton()
+        pp_hint_btn.setIcon(self.style().standardIcon(
+            QStyle.StandardPixmap.SP_MessageBoxQuestion))
+        pp_hint_btn.setIconSize(QSize(18, 18))
+        pp_hint_btn.setToolTip("How PP Table RAM patching works")
+        pp_hint_btn.setStyleSheet(
+            "QToolButton { border: none; background: transparent; }")
+        pp_hint_btn.setCursor(Qt.CursorShape.WhatsThisCursor)
+        pp_hint_btn.clicked.connect(
+            lambda: self._show_smu_cheatsheet("PP", self._PP_HELP_HTML))
+        pp_hint_row = QHBoxLayout()
+        pp_hint_row.addWidget(pp_hint_btn)
+        pp_hint_row.addWidget(QLabel("<b>PP — PowerPlay Table</b>"))
+        pp_hint_row.addStretch()
+        pp_tab_layout.addLayout(pp_hint_row)
         pp_tab_layout.addWidget(pp_scroll)
 
-        # (2) OD Section — OverDrive Table with per-row Set buttons
-        od_grp = QGroupBox("OD — OverDrive Table")
-        od_table = QTableWidget()
-        od_table.setColumnCount(7)
-        od_table.setHorizontalHeaderLabels([
-            "Human name", "Table key", "Unit", "Allowed",
-            "Current value", "Custom input", "Set",
-        ])
-        od_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        od_table.horizontalHeader().setStretchLastSection(True)
-        self._detailed_tables["OD"] = od_table
-        self._param_od_array_spec = {}  # key -> (attr, index) for array fields
+        # (2) OD Section — extracted into _setup_od_subtab, lives as SMU sub-tab
+        self._od_scroll = self._setup_od_subtab(decoded)
+
+        self._detailed_worker = None
+
+    def _show_smu_cheatsheet(self, title: str, html: str):
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Cheatsheet — {title}")
+        dlg.resize(620, 480)
+        lay = QVBoxLayout(dlg)
+        browser = QTextBrowser()
+        browser.setOpenExternalLinks(False)
+        browser.setHtml(html)
+        lay.addWidget(browser)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        lay.addLayout(btn_row)
+        dlg.exec()
+
+    _PP_HELP_HTML = """
+<h3>PP &mdash; PowerPlay Table RAM Patching</h3>
+<p>The PP tab patches the driver&rsquo;s in-memory copies of the
+<b>PowerPlay (PP) table</b> at physical addresses discovered by <b>Scan</b>.
+This directly changes the limits the driver reads when configuring the GPU.</p>
+
+<h4>Clocks &amp; Power rows</h4>
+<p>For clock and power-limit rows (Game Clock, Boost Clock, PPT, TDC, etc.),
+Apply PP does <b>two things</b>:</p>
+<ol>
+  <li><b>RAM patch</b> &mdash; overwrites the field in every discovered PP table
+      copy so the driver sees your value.</li>
+  <li><b>SMU commands</b> &mdash; sends <code>SetSoftMinByFreq</code>,
+      <code>SetSoftMaxByFreq</code>, <code>SetHardMinByFreq</code>,
+      <code>SetHardMaxByFreq</code>, <code>DisallowGfxOff</code>, and
+      workload-mask cycling to the SMU so the firmware enforces the new
+      limits immediately.</li>
+</ol>
+
+<h4>MsgLimits rows</h4>
+<p>For power-limit fields (PPT), Apply PP also sends
+<code>SetPptLimit</code> to the SMU in addition to the RAM patch.</p>
+
+<h4>Custom PP fields (fan, voltage, freq, board)</h4>
+<p>Rows in the lower &ldquo;custom&rdquo; section are <b>RAM-only</b>: they
+patch the PP table bytes in driver memory but do <i>not</i> send any SMU
+commands. The driver picks up the new values on its next read of the table.</p>
+
+<h4>Prerequisites &amp; Volatility</h4>
+<ul>
+  <li>A successful <b>Scan</b> is required before Apply PP can locate the PP
+      table copies in physical memory.</li>
+  <li>All changes are <b>volatile</b> &mdash; lost on reboot, driver reload, or
+      GPU reset.</li>
+</ul>
+"""
+
+    _OD_HELP_HTML = """
+<h3>OD &mdash; OverDrive Table</h3>
+<p>The OD tab sends the <b>OverDrive settings table</b> to the GPU's System
+Management Unit (SMU) via the SMU table-transfer mailbox. Unlike PP patching
+(which writes to the driver's RAM copy of the PowerPlay table), OD talks
+directly to the SMU firmware.</p>
+
+<h4>What you can change</h4>
+<ul>
+  <li><b>Gfxclk Offset</b> &mdash; Positive MHz offset added to the graphics
+      clock. The SMU adds this on top of whatever DPM level it selects.</li>
+  <li><b>PPT %</b> / <b>TDC %</b> &mdash; Package Power Tracking and Thermal
+      Design Current percentage offsets. +10 means &ldquo;allow 10&percnt; more
+      than stock&rdquo;.</li>
+  <li><b>UCLK / FCLK min&thinsp;/&thinsp;max</b> &mdash; Memory controller and
+      data-fabric clock boundaries.</li>
+  <li><b>V/F Zone offsets</b> &mdash; Per-zone voltage offsets on the GFX
+      voltage-frequency curve (6 points).</li>
+  <li><b>VddGfx / VddSoc Vmax</b> &mdash; Maximum voltage caps for the GFX
+      core and SoC rails.</li>
+  <li><b>Fan controls</b> &mdash; Target temperature, min PWM, fan-curve
+      points, acoustic limits, zero-RPM enable.</li>
+  <li><b>EDC / PCC</b> &mdash; Electrical Design Current and PCC limit
+      controls.</li>
+  <li><b>Full Ctrl fields</b> &mdash; Advanced voltage, clock, and power-saving
+      overrides (requires AdvancedOdModeEnabled&thinsp;=&thinsp;1).</li>
+</ul>
+
+<h4>How &ldquo;Apply OD&rdquo; works</h4>
+<p>Clicking <b>Apply OD</b> calls <code>apply_od_table_only</code>, which
+reads the current OD table from the SMU, merges your edits into it, and writes
+the modified table back. Each per-row <b>Set</b> button calls
+<code>apply_od_single_field</code> to change one field at a time.</p>
+
+<h4>Volatility</h4>
+<p>All OD changes are <b>volatile</b> &mdash; they are lost on reboot, driver
+reload, or GPU reset. To persist settings across reboots, re-apply them after
+each startup (or use the Simple Settings tab with the watchdog).</p>
+
+<h4>Allowed column</h4>
+<p>The <i>Allowed</i> column shows whether the VBIOS OD limits permit changing
+that feature. &ldquo;No&rdquo; means the SMU will likely reject the change
+unless you first patch the PP table to unlock the corresponding OD feature
+bit.</p>
+"""
+
+    def _setup_od_subtab(self, decoded):
+        """Build the OD (OverDrive) sub-tab contents and return a QScrollArea."""
         od_limits = extract_od_limits_from_decoded(decoded)
+        self._param_od_array_spec = {}
+
+        def _add_od_row(table, human, key, unit, vb_val, smu_key, widget, row_apply_fn=None,
+                       feature_bit=None, limits_key=None):
+            row = table.rowCount()
+            table.insertRow(row)
+            table.setItem(row, 0, QTableWidgetItem(human))
+            table.setItem(row, 1, QTableWidgetItem(key))
+            table.setItem(row, 2, QTableWidgetItem(unit))
+            allowed_str = "—"
+            if od_limits is not None and feature_bit is not None:
+                allowed_str = "Yes" if od_limits.is_allowed(feature_bit) else "No"
+            table.setItem(row, 3, QTableWidgetItem(allowed_str))
+            cv_label = QLabel("—")
+            table.setCellWidget(row, 4, cv_label)
+            table.setCellWidget(row, 5, widget)
+            self._param_smu_key[key] = smu_key
+            self._param_current_value_widget[key] = cv_label
+            self._param_unit[key] = f" {unit}" if unit else ""
+            self._detailed_param_widgets[key] = widget
+            if od_limits is not None:
+                lk = limits_key if limits_key is not None else key
+                rng = od_limits.get_range(lk)
+                if rng is not None:
+                    widget.setRange(rng[0], rng[1])
+            if row_apply_fn is not None:
+                btn = QPushButton("Set")
+                btn.setMaximumWidth(50)
+                _label = human
+                _fn = row_apply_fn
+                btn.clicked.connect(lambda checked=False, fn=_fn, lbl=_label:
+                                    self._run_with_hardware(f"Set {lbl}", fn, require_scan=False))
+                table.setCellWidget(row, 6, btn)
 
         def _mk_od_apply(od_attr, feature_bit, spin, label):
             def fn(hw):
@@ -1624,7 +1733,6 @@ rather than <i>against</i> you. Both are needed for a robust overclock.</p>
                 msg = f"OD: Set {label} = {spin.value()} failed: {err}"
                 self._log(msg)
                 return (False, msg)
-
             return fn
 
         def _mk_od_apply_array(attr, idx, feature_bit, spin, label):
@@ -1640,8 +1748,36 @@ rather than <i>against</i> you. Both are needed for a robust overclock.</p>
                 msg = f"OD: Set {label} = {spin.value()} failed: {err}"
                 self._log(msg)
                 return (False, msg)
-
             return fn
+
+        od_w = QWidget()
+        od_top_layout = QVBoxLayout(od_w)
+
+        hint_btn = QToolButton()
+        hint_btn.setIcon(self.style().standardIcon(
+            QStyle.StandardPixmap.SP_MessageBoxQuestion))
+        hint_btn.setIconSize(QSize(18, 18))
+        hint_btn.setToolTip("Open cheatsheet for OD")
+        hint_btn.setStyleSheet(
+            "QToolButton { border: none; background: transparent; }")
+        hint_btn.setCursor(Qt.CursorShape.WhatsThisCursor)
+        hint_btn.clicked.connect(
+            lambda: self._show_smu_cheatsheet("OD", self._OD_HELP_HTML))
+        hint_row = QHBoxLayout()
+        hint_row.addWidget(hint_btn)
+        hint_row.addWidget(QLabel("<b>OD — OverDrive Table</b>"))
+        hint_row.addStretch()
+        od_top_layout.addLayout(hint_row)
+
+        od_table = QTableWidget()
+        od_table.setColumnCount(7)
+        od_table.setHorizontalHeaderLabels([
+            "Human name", "Table key", "Unit", "Allowed",
+            "Current value", "Custom input", "Set",
+        ])
+        od_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        od_table.horizontalHeader().setStretchLastSection(True)
+        self._detailed_tables["OD"] = od_table
 
         det_gfx_offset = QSpinBox()
         det_gfx_offset.setRange(0, 2000)
@@ -1703,7 +1839,6 @@ rather than <i>against</i> you. Both are needed for a robust overclock.</p>
                     row_apply_fn=_mk_od_apply("FclkFmax", PP_OD_FEATURE_FCLK_BIT, det_fclk_max, "FCLK max"),
                     feature_bit=PP_OD_FEATURE_FCLK_BIT)
 
-        # Voltage offsets per V/F zone (6 points)
         for i in range(PP_NUM_OD_VF_CURVE_POINTS):
             key = f"VoltageOffsetZone{i}"
             self._param_od_array_spec[key] = ("VoltageOffsetPerZoneBoundary", i)
@@ -1716,7 +1851,6 @@ rather than <i>against</i> you. Both are needed for a robust overclock.</p>
                             "VoltageOffsetPerZoneBoundary", i, PP_OD_FEATURE_GFX_VF_CURVE_BIT, spin, f"V/F Zone {i}"),
                         feature_bit=PP_OD_FEATURE_GFX_VF_CURVE_BIT, limits_key="VoltageOffsetPerZoneBoundary")
 
-        # VddGfxVmax, VddSocVmax
         det_vdd_gfx = QSpinBox()
         det_vdd_gfx.setRange(0, 2000)
         det_vdd_gfx.setValue(0)
@@ -1735,7 +1869,6 @@ rather than <i>against</i> you. Both are needed for a robust overclock.</p>
                     row_apply_fn=_mk_od_apply("VddSocVmax", PP_OD_FEATURE_SOC_VMAX_BIT, det_vdd_soc, "VddSoc Vmax"),
                     feature_bit=PP_OD_FEATURE_SOC_VMAX_BIT)
 
-        # Fan controls
         det_fan_target_temp = QSpinBox()
         det_fan_target_temp.setRange(0, 120)
         det_fan_target_temp.setValue(0)
@@ -1762,7 +1895,6 @@ rather than <i>against</i> you. Both are needed for a robust overclock.</p>
                     row_apply_fn=_mk_od_apply("MaxOpTemp", PP_OD_FEATURE_TEMPERATURE_BIT, det_max_op_temp, "Max Op Temp"),
                     feature_bit=PP_OD_FEATURE_TEMPERATURE_BIT)
 
-        # EDC / PCC
         det_gfx_edc = QSpinBox()
         det_gfx_edc.setRange(-32768, 32767)
         det_gfx_edc.setValue(0)
@@ -1779,7 +1911,6 @@ rather than <i>against</i> you. Both are needed for a robust overclock.</p>
                     row_apply_fn=_mk_od_apply("GfxPccLimitControl", PP_OD_FEATURE_EDC_BIT, det_gfx_pcc, "Gfx PCC Limit"),
                     feature_bit=PP_OD_FEATURE_EDC_BIT)
 
-        # GfxclkFmaxVmax
         det_gfx_fmax_vmax = QSpinBox()
         det_gfx_fmax_vmax.setRange(0, 5000)
         det_gfx_fmax_vmax.setValue(0)
@@ -1931,8 +2062,7 @@ rather than <i>against</i> you. Both are needed for a robust overclock.</p>
                     row_apply_fn=_mk_od_apply("FclkFullCtrlMode", PP_OD_FEATURE_FULL_CTRL_BIT, det_fclk_full, "FCLK Full Ctrl"),
                     feature_bit=PP_OD_FEATURE_FULL_CTRL_BIT)
 
-        od_layout = QVBoxLayout(od_grp)
-        od_layout.addWidget(od_table)
+        od_top_layout.addWidget(od_table)
         od_btn_row = QHBoxLayout()
         self.od_refresh_btn = QPushButton("Refresh")
         self.od_refresh_btn.setToolTip("Read live values from RAM and SMU")
@@ -1943,36 +2073,16 @@ rather than <i>against</i> you. Both are needed for a robust overclock.</p>
         self.od_apply_btn.setToolTip("Sends OD table (offset, PPT%, TDC%, UCLK/FCLK) to SMU via table transfer")
         self.od_apply_btn.clicked.connect(self._on_apply_od)
         od_btn_row.addWidget(self.od_apply_btn)
-        od_layout.addLayout(od_btn_row)
+        od_top_layout.addLayout(od_btn_row)
 
         od_scroll = QScrollArea()
         od_scroll.setWidgetResizable(True)
-        od_scroll.setWidget(od_grp)
-        od_tab_layout = QVBoxLayout(self.od_tab)
-        od_tab_layout.addWidget(od_scroll)
-
-        self._detailed_worker = None
-
-    def _show_smu_cheatsheet(self, title: str, html: str):
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"Cheatsheet — {title}")
-        dlg.resize(620, 480)
-        lay = QVBoxLayout(dlg)
-        browser = QTextBrowser()
-        browser.setOpenExternalLinks(False)
-        browser.setHtml(html)
-        lay.addWidget(browser)
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(dlg.accept)
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        btn_row.addWidget(close_btn)
-        lay.addLayout(btn_row)
-        dlg.exec()
+        od_scroll.setWidget(od_w)
+        return od_scroll
 
     def _setup_smu_tab(self):
-        """Set up the SMU tab with a nested QTabWidget containing 5 sub-tabs:
-        Status, Clock Limits, Controls, Features, Tables.
+        """Set up the SMU tab with a nested QTabWidget containing 6 sub-tabs:
+        Status, Clock Limits, Controls, Features, Tables, OD.
         """
         from src.engine.smu import _CLK_NAMES as _ALL_CLK_NAMES
         from src.engine.overclock_engine import read_smu_metrics_full
@@ -2878,9 +2988,20 @@ parsed live performance metrics; the bottom section lets you dump raw tables as 
 
 <p><b>Throttling (%)</b></p>
 <ul>
-  <li><b>ThrottlingPercentage_0 through _20</b> — Per-throttler activity. Each index maps to
-      a specific throttler (thermal, power, current, etc.). 0 = not throttling, 100 = fully
-      throttled. The 21 indices correspond to the SMU's internal throttler array.</li>
+  <li><b>Throttle_Temp_Edge / Hotspot / Hotspot_GFX / Hotspot_SOC</b> — Thermal throttling
+      from edge, hotspot (junction), GFX-specific hotspot, or SOC hotspot sensors.</li>
+  <li><b>Throttle_Temp_Mem</b> — Memory temperature throttling.</li>
+  <li><b>Throttle_Temp_VR_GFX / VR_SOC / VR_Mem0 / VR_Mem1</b> — Voltage regulator
+      thermal throttling for GFX, SOC, and memory VRMs.</li>
+  <li><b>Throttle_Temp_Liquid0 / Liquid1 / PLX</b> — Liquid cooling and PLX sensor throttling.</li>
+  <li><b>Throttle_TDC_GFX / TDC_SOC</b> — Thermal Design Current limit. Fires when the
+      current draw of the GFX or SOC rail approaches the VRM current limit.</li>
+  <li><b>Throttle_PPT0 / PPT1 / PPT2 / PPT3</b> — Package Power Tracking limits. PPT0 is
+      the primary board power limit. Non-zero means the SMU is actively reducing clocks
+      to stay within the power budget.</li>
+  <li><b>Throttle_FIT</b> — Failure In Time / reliability throttling.</li>
+  <li><b>Throttle_GFX_APCC_Plus</b> — Adaptive Power Control Circuit throttling.</li>
+  <li><b>Throttle_GFX_DVO</b> — Digital Voltage Optimizer throttling.</li>
   <li><b>VmaxThrottlingPercentage</b> — How much the maximum-voltage limiter is restricting
       clocks.</li>
 </ul>
@@ -2939,9 +3060,8 @@ parsed live performance metrics; the bottom section lets you dump raw tables as 
       enable masks. The layout is GPU-generation-specific.</li>
   <li><b>Read Driver Info</b> (table id 10) — DPM frequency tables and driver state. Shows
       all DPM levels the SMU has configured for each clock domain.</li>
-  <li><b>Read ECC Info</b> (table id 11) — Error-correction counters. Same data as the
-      dedicated ECC tab. Shows correctable/uncorrectable error counts per memory
-      partition.</li>
+  <li><b>Read ECC Info</b> (table id 11) — Error-correction counters. Shows
+      correctable/uncorrectable error counts per memory partition.</li>
 </ul>
 
 <h4>UI controls</h4>
@@ -2967,8 +3087,8 @@ parsed live performance metrics; the bottom section lets you dump raw tables as 
   <li>Reading tables while the GPU is under heavy load may briefly stall the SMU command
       interface.</li>
   <li>D3Hot counters and APU/STAPM fields are typically zero on desktop GPUs.</li>
-  <li>ThrottlingPercentage indices are not named in the metrics struct; their mapping to
-      specific throttlers (thermal, power, current, etc.) depends on SMU firmware version.</li>
+  <li>Throttler names (Temp_Edge, PPT0, TDC_GFX, etc.) are from the SMU v14.0 firmware
+      header (smu14_driver_if_v14_0.h). Values are 0-100% activity percentage.</li>
   <li>PublicSerialNumber fields may be zero if the GPU vendor has not programmed a serial.</li>
 </ul>
 """
@@ -3051,7 +3171,7 @@ parsed live performance metrics; the bottom section lets you dump raw tables as 
 
         self._smu_read_ecc_btn = QPushButton("Read ECC Info")
         self._smu_read_ecc_btn.setToolTip(
-            "TABLE_ECCINFO (id=11) — same data as the ECC tab")
+            "TABLE_ECCINFO (id=11) — ECC error-correction counters")
         self._smu_read_ecc_btn.clicked.connect(
             lambda: self._on_smu_read_other_table("EccInfo", TABLE_ECCINFO))
         other_btn_row.addWidget(self._smu_read_ecc_btn)
@@ -3075,6 +3195,7 @@ parsed live performance metrics; the bottom section lets you dump raw tables as 
         tables_scroll.setWidgetResizable(True)
         tables_scroll.setWidget(tables_w)
         self._smu_inner_tabs.addTab(tables_scroll, "Tables")
+        self._smu_inner_tabs.addTab(self._od_scroll, "OD")
 
     # ------------------------------------------------------------------
     # Tables sub-tab: metrics helpers
@@ -3217,344 +3338,6 @@ parsed live performance metrics; the bottom section lets you dump raw tables as 
         self._smu_read_pptable_btn.setEnabled(True)
         self._smu_read_driver_info_btn.setEnabled(True)
         self._smu_read_ecc_btn.setEnabled(True)
-
-    def _setup_smu_tricks_tab(self):
-        """SMU Tricks tab: granular individual control over GFXCLK SoftMin/Max, HardMin/Max."""
-        layout = QVBoxLayout(self.smu_tricks_tab)
-
-        header = QLabel("SMU Tricks — Granular GFXCLK Frequency Control")
-        header.setStyleSheet("font-weight: bold; font-size: 11pt;")
-        layout.addWidget(header)
-
-        desc = QLabel(
-            "Control each GFXCLK frequency limit individually via direct SMU commands. "
-            "Press Refresh to read current values from the SMU before making changes."
-        )
-        desc.setWordWrap(True)
-        desc.setStyleSheet("color: #aaa; padding: 4px 0;")
-        layout.addWidget(desc)
-
-        refresh_row = QHBoxLayout()
-        self.smu_tricks_refresh_btn = QPushButton("Refresh")
-        self.smu_tricks_refresh_btn.setToolTip("Read current DPM frequency limits from SMU")
-        self.smu_tricks_refresh_btn.clicked.connect(self._on_smu_tricks_refresh)
-        refresh_row.addWidget(self.smu_tricks_refresh_btn)
-        refresh_row.addStretch()
-        layout.addLayout(refresh_row)
-
-        self.smu_tricks_table = QTableWidget()
-        self.smu_tricks_table.setColumnCount(4)
-        self.smu_tricks_table.setHorizontalHeaderLabels(["Name", "Current", "Input", "Apply"])
-        self.smu_tricks_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.smu_tricks_table.horizontalHeader().setStretchLastSection(True)
-        self.smu_tricks_table.verticalHeader().setVisible(False)
-
-        self._smu_tricks_params = [
-            ("GFXCLK SoftMin", "SoftMin", PPSMC.SetSoftMinByFreq, "min"),
-            ("GFXCLK SoftMax", "SoftMax", PPSMC.SetSoftMaxByFreq, "max"),
-            ("GFXCLK HardMin", "HardMin", PPSMC.SetHardMinByFreq, "min"),
-            ("GFXCLK HardMax", "HardMax", PPSMC.SetHardMaxByFreq, "max"),
-        ]
-        self._smu_tricks_spins: dict[str, QSpinBox] = {}
-        self._smu_tricks_current_items: dict[str, QTableWidgetItem] = {}
-
-        for i, (name, key, msg_id, _dpm_field) in enumerate(self._smu_tricks_params):
-            self.smu_tricks_table.insertRow(i)
-
-            name_item = QTableWidgetItem(name)
-            name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.smu_tricks_table.setItem(i, 0, name_item)
-
-            current_item = QTableWidgetItem("—")
-            current_item.setFlags(current_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.smu_tricks_table.setItem(i, 1, current_item)
-            self._smu_tricks_current_items[key] = current_item
-
-            spin = QSpinBox()
-            spin.setRange(0, 5000)
-            spin.setValue(0)
-            spin.setSpecialValueText("—")
-            spin.setSuffix(" MHz")
-            self.smu_tricks_table.setCellWidget(i, 2, spin)
-            self._smu_tricks_spins[key] = spin
-
-            btn = QPushButton("Apply")
-            btn.setMaximumWidth(70)
-            _key = key
-            _msg_id = msg_id
-            _name = name
-            btn.clicked.connect(
-                lambda checked=False, k=_key, m=_msg_id, n=_name:
-                    self._on_smu_tricks_apply(k, m, n)
-            )
-            self.smu_tricks_table.setCellWidget(i, 3, btn)
-
-        self.smu_tricks_table.setMaximumHeight(180)
-        layout.addWidget(self.smu_tricks_table)
-
-        algo_label = QLabel("Algorithm Reference")
-        algo_label.setStyleSheet("font-weight: bold; margin-top: 12px;")
-        layout.addWidget(algo_label)
-
-        algo_text = QLabel(
-            "When you hit Apply on a single row, the tool performs this sequence:\n"
-            "  1. Send the selected SMU set-frequency command:\n"
-            "       SetSoftMinByFreq(GFXCLK, value)  — soft minimum frequency floor\n"
-            "       SetSoftMaxByFreq(GFXCLK, value)  — soft maximum frequency ceiling\n"
-            "       SetHardMinByFreq(GFXCLK, value)  — hard minimum (absolute floor)\n"
-            "       SetHardMaxByFreq(GFXCLK, value)  — hard maximum (absolute ceiling)\n"
-            "  2. SetWorkloadMask(PowerSave), wait 300 ms  — trigger DPM refresh\n"
-            "  3. SetWorkloadMask(3D Fullscreen), wait 300 ms — settle on gaming profile\n"
-            "\n"
-            "Steps 2-3 cycle the workload mask to force the SMU to re-evaluate DPM\n"
-            "limits with the new value. Without this cycle, the SMU acknowledges the\n"
-            "command but the effective limits remain unchanged.\n"
-            "\n"
-            "For comparison, the Simple tab runs the full sequence in order:\n"
-            "  1. Patch GameClockAc & BoostClockAc in all RAM PPTable copies\n"
-            "  2. SetSoftMaxByFreq(GFXCLK, clock + offset)          — raise ceiling first\n"
-            "  3. SetHardMaxByFreq(GFXCLK, clock + offset)          — then hard ceiling\n"
-            "  4. SetSoftMinByFreq(GFXCLK, clock)                   — raise floor\n"
-            "  5. SetHardMinByFreq(GFXCLK, clock)                   — then hard floor\n"
-            "  6. DisallowGfxOff                                     — prevent idle power gate\n"
-            "  7. DisableSmuFeatures(DS_GFXCLK | GFX_ULV | GFXOFF)  — lock features (if enabled)\n"
-            "  8. SetWorkloadMask(PowerSave), wait 300 ms            — trigger DPM refresh\n"
-            "  9. SetWorkloadMask(3D Fullscreen), wait 300 ms        — settle on gaming profile\n"
-            "\n"
-            "Note: The SMU only reports effective DPM min/max — soft and hard limits\n"
-            "cannot be queried separately. Current column shows DPM Min for the *Min\n"
-            "rows and DPM Max for the *Max rows."
-        )
-        algo_text.setWordWrap(True)
-        algo_text.setStyleSheet(
-            "color: #aaa; font-size: 9pt; padding: 10px; "
-            "background: #1a1a2a; border-radius: 4px; font-family: Consolas, monospace;"
-        )
-        layout.addWidget(algo_text)
-
-        layout.addStretch()
-        self._smu_tricks_worker = None
-
-    def _setup_ecc_tab(self):
-        """ECC tab: read ECC counters from SMU via table transfer."""
-        layout = QVBoxLayout(self.ecc_tab)
-
-        header = QLabel("ECC Counters — SMU TABLE_ECCINFO Transfer")
-        header.setStyleSheet("font-weight: bold; font-size: 11pt;")
-        layout.addWidget(header)
-
-        desc = QLabel(
-            "Read correctable error (CE) counters from the SMU. "
-            "Counters are read-and-clear: the SMU resets them after each transfer, "
-            "so we accumulate across reads (like the Linux amdgpu driver)."
-        )
-        desc.setWordWrap(True)
-        desc.setStyleSheet("color: #aaa; padding: 4px 0;")
-        layout.addWidget(desc)
-
-        refresh_row = QHBoxLayout()
-        self.ecc_refresh_btn = QPushButton("Refresh")
-        self.ecc_refresh_btn.setToolTip("Transfer ECC table from SMU and read counters")
-        self.ecc_refresh_btn.clicked.connect(self._on_ecc_refresh)
-        refresh_row.addWidget(self.ecc_refresh_btn)
-        self.ecc_reset_btn = QPushButton("Reset Totals")
-        self.ecc_reset_btn.setToolTip("Clear the accumulated counters (SMU counters are unaffected)")
-        self.ecc_reset_btn.clicked.connect(self._on_ecc_reset)
-        refresh_row.addWidget(self.ecc_reset_btn)
-        refresh_row.addStretch()
-        layout.addLayout(refresh_row)
-
-        self.ecc_summary_label = QLabel("—")
-        self.ecc_summary_label.setWordWrap(True)
-        self.ecc_summary_label.setStyleSheet(
-            "background: #2a2a2a; color: #ddd; padding: 8px; border-radius: 4px; "
-            "font-family: Consolas, monospace; font-size: 9pt;"
-        )
-        layout.addWidget(self.ecc_summary_label)
-
-        self.ecc_table_widget = QTableWidget()
-        self.ecc_table_widget.setColumnCount(5)
-        self.ecc_table_widget.setHorizontalHeaderLabels([
-            "Channel", "This Read", "Accumulated", "Status", "MCA Addr",
-        ])
-        self.ecc_table_widget.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.ecc_table_widget.horizontalHeader().setStretchLastSection(True)
-        self.ecc_table_widget.setMaximumHeight(280)
-        layout.addWidget(self.ecc_table_widget)
-
-        self.ecc_raw_label = QLabel("")
-        self.ecc_raw_label.setWordWrap(True)
-        self.ecc_raw_label.setStyleSheet(
-            "background: #1a1a2a; color: #8a8; padding: 6px; border-radius: 4px; "
-            "font-family: Consolas, monospace; font-size: 8pt;"
-        )
-        self.ecc_raw_label.setMaximumHeight(160)
-        self.ecc_raw_label.hide()
-        layout.addWidget(self.ecc_raw_label)
-
-        layout.addStretch()
-        self._ecc_worker = None
-        self._ecc_accum = EccAccumulator()
-
-    def _on_ecc_refresh(self):
-        """Read ECC counters from SMU."""
-        if self._ecc_worker is not None and self._ecc_worker.isRunning():
-            return
-        self.ecc_refresh_btn.setEnabled(False)
-        self.ecc_summary_label.setText("Reading...")
-        self.ecc_table_widget.setRowCount(0)
-        self._ecc_worker = EccRefreshWorker(self)
-        self._ecc_worker.results_signal.connect(self._on_ecc_refresh_results)
-        self._ecc_worker.finished.connect(self._enable_ecc_refresh)
-        self._ecc_worker.start()
-        self._log("ECC: reading counters from SMU...")
-
-    def _enable_ecc_refresh(self):
-        self._ecc_worker = None
-        self.ecc_refresh_btn.setEnabled(True)
-
-    def _on_ecc_reset(self):
-        """Reset accumulated ECC counters (SMU-side counters are unaffected)."""
-        self._ecc_accum = EccAccumulator()
-        self.ecc_table_widget.setRowCount(0)
-        self.ecc_summary_label.setText("Accumulated totals reset.")
-        self.ecc_raw_label.hide()
-        self._log("ECC: accumulated totals reset")
-
-    def _on_ecc_refresh_results(self, result):
-        """Update ECC tab with table data, accumulating across reads."""
-        self.ecc_table_widget.setRowCount(0)
-
-        if isinstance(result, dict) and "error" in result:
-            self.ecc_summary_label.setText(f"Error: {result['error']}")
-            self._log(f"ECC refresh failed: {result['error']}")
-            return
-
-        if isinstance(result, tuple) and len(result) == 2:
-            ecc_table, raw_bytes = result
-        else:
-            ecc_table, raw_bytes = result, None
-
-        if ecc_table is None:
-            self.ecc_summary_label.setText(
-                "ECC table transfer failed or TABLE_ECCINFO not supported on this firmware."
-            )
-            self._log("ECC: not supported or transfer failed")
-            return
-
-        # Check for firmware stub / test pattern
-        test_msg = detect_test_pattern(raw_bytes)
-        if test_msg:
-            self.ecc_summary_label.setText(test_msg)
-            self._log(f"ECC: test pattern detected — {test_msg}")
-            if raw_bytes:
-                hex_dump = format_raw_hex(raw_bytes[:128])
-                self.ecc_raw_label.setText(f"Raw ECC table (first 128 bytes):\n{hex_dump}")
-                self.ecc_raw_label.show()
-            return
-
-        this_read = total_ce_count(ecc_table)
-        self._ecc_accum.add(ecc_table)
-        grand = self._ecc_accum.grand_total()
-        reads = self._ecc_accum.reads
-
-        self.ecc_summary_label.setText(
-            f"This read: {this_read} CE  |  Accumulated total: {grand} CE  "
-            f"({reads} read{'s' if reads != 1 else ''})"
-        )
-
-        this_summary = format_ecc_summary(ecc_table)
-        accum_summary = self._ecc_accum.per_channel_summary()
-
-        all_channels = sorted(set(
-            [ch for ch, _, _ in this_summary] +
-            [ch for ch, _, _ in accum_summary]
-        ))
-        this_map = {ch: ce for ch, ce, _ in this_summary}
-        accum_map = {ch: (ce, st) for ch, ce, st in accum_summary}
-
-        for ch in all_channels:
-            row = self.ecc_table_widget.rowCount()
-            self.ecc_table_widget.insertRow(row)
-            self.ecc_table_widget.setItem(row, 0, QTableWidgetItem(str(ch)))
-            self.ecc_table_widget.setItem(row, 1, QTableWidgetItem(
-                str(this_map.get(ch, 0))))
-            acc_ce, acc_st = accum_map.get(ch, (0, "—"))
-            self.ecc_table_widget.setItem(row, 2, QTableWidgetItem(str(acc_ce)))
-            self.ecc_table_widget.setItem(row, 3, QTableWidgetItem(acc_st))
-            mca_addr = self._ecc_accum.last_mca_addr[ch]
-            mca = f"0x{mca_addr:X}" if mca_addr else "—"
-            self.ecc_table_widget.setItem(row, 4, QTableWidgetItem(mca))
-
-        if raw_bytes:
-            hex_dump = format_raw_hex(raw_bytes[:128])
-            self.ecc_raw_label.setText(f"Raw ECC table (first 128 bytes):\n{hex_dump}")
-            self.ecc_raw_label.show()
-
-        self._log(f"ECC: this_read={this_read} CE, accumulated={grand} CE (reads={reads})")
-
-    def _on_smu_tricks_refresh(self):
-        """Read current DPM frequency limits from SMU for the SMU Tricks table."""
-        if self._smu_tricks_worker is not None and self._smu_tricks_worker.isRunning():
-            return
-        self.smu_tricks_refresh_btn.setEnabled(False)
-        self._smu_tricks_worker = SmuTricksRefreshWorker(self)
-        self._smu_tricks_worker.results_signal.connect(self._on_smu_tricks_refresh_results)
-        self._smu_tricks_worker.finished.connect(self._enable_smu_tricks_refresh)
-        self._smu_tricks_worker.start()
-        self._log("SMU Tricks: reading DPM frequency limits...")
-
-    def _enable_smu_tricks_refresh(self):
-        self._smu_tricks_worker = None
-        self.smu_tricks_refresh_btn.setEnabled(True)
-
-    def _on_smu_tricks_refresh_results(self, result):
-        """Update SMU Tricks table with current DPM min/max from SMU."""
-        if "error" in result:
-            self._log(f"SMU Tricks refresh failed: {result['error']}")
-            return
-
-        dpm_min = result["min"]
-        dpm_max = result["max"]
-
-        for key, item in self._smu_tricks_current_items.items():
-            if key in ("SoftMin", "HardMin"):
-                item.setText(f"{dpm_min} MHz")
-            else:
-                item.setText(f"{dpm_max} MHz")
-
-        for key, spin in self._smu_tricks_spins.items():
-            if key in ("SoftMin", "HardMin"):
-                spin.setValue(dpm_min)
-            else:
-                spin.setValue(dpm_max)
-
-        self._log(f"SMU Tricks: DPM min={dpm_min} MHz, max={dpm_max} MHz")
-
-    def _on_smu_tricks_apply(self, key, msg_id, name):
-        """Apply a single GFXCLK frequency limit via SMU, then cycle workload mask to force DPM refresh."""
-        spin = self._smu_tricks_spins[key]
-        val = spin.value()
-        if val <= 0:
-            self._log(f"SMU Tricks: {name} skipped (no value set)")
-            return
-
-        def do_apply(hw):
-            smu = hw["smu"]
-            param = ((PPCLK.GFXCLK & 0xFFFF) << 16) | (val & 0xFFFF)
-            resp, _ = smu.send_msg(msg_id, param)
-            if resp == 1:
-                self._log(f"SMU Tricks: {name} = {val} MHz (OK)")
-            else:
-                self._log(f"SMU Tricks: {name} = {val} MHz (resp=0x{resp:02X})")
-                return
-            smu.send_msg(PPSMC.SetWorkloadMask, 1 << 2)   # PowerSave
-            time.sleep(0.3)
-            smu.send_msg(PPSMC.SetWorkloadMask, 1 << 1)   # 3D Fullscreen
-            time.sleep(0.3)
-            self._log(f"SMU Tricks: DPM refresh cycle done")
-
-        self._run_with_hardware(f"SMU Tricks: {name}", do_apply, require_scan=False)
 
     def _setup_memory_tab(self):
         """Memory tab: view of PPTable copies in RAM, manual refresh."""
@@ -3989,6 +3772,10 @@ current registry value so you can tweak them manually.</p>
         """Update registry table from report."""
         self._populate_reg_table(report)
 
+    # ===================================================================
+    # Memory tab
+    # ===================================================================
+
     def _on_memory_refresh_click(self):
         """Manual refresh: read PPTable data from all scanned addresses."""
         if self._memory_worker is not None and self._memory_worker.isRunning():
@@ -4414,17 +4201,26 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    global _atexit_clean
     _log_to_file("main(): starting application")
-    if getattr(sys, "frozen", False):
-        ensure_driver_files_copied()
-    app = QApplication(sys.argv)
-    app.setApplicationName("RDNA4 Overclock")
-    win = MainWindow()
-    win.show()
-    _log_to_file("main(): window shown, entering event loop")
-    ret = app.exec()
-    _log_to_file(f"main(): event loop exited with code {ret}")
-    return ret
+    try:
+        if getattr(sys, "frozen", False):
+            ensure_driver_files_copied()
+        app = QApplication(sys.argv)
+        app.setApplicationName("RDNA4 Overclock")
+        win = MainWindow()
+        win.show()
+        _log_to_file("main(): window shown, entering event loop")
+        ret = app.exec()
+        _log_to_file(f"main(): event loop exited with code {ret}")
+        _atexit_clean = True
+        return ret
+    except SystemExit:
+        _atexit_clean = True
+        raise
+    except Exception:
+        _log_exception_to_file("main()")
+        raise
 
 
 if __name__ == "__main__":

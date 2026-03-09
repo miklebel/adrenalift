@@ -54,7 +54,6 @@ from src.engine.od_table import (TABLE_OVERDRIVE, TABLE_SMU_METRICS, TABLE_PPTAB
                       PP_OD_FEATURE_GFX_VMAX_BIT, PP_OD_FEATURE_SOC_VMAX_BIT,
                       PP_OD_FEATURE_FAN_CURVE_BIT, PP_OD_FEATURE_EDC_BIT,
                       PP_NUM_OD_VF_CURVE_POINTS)
-from src.engine import ecc as _ecc
 from src.engine.smu_metrics import (SmuMetrics_t, SMU_METRICS_SIZE,
                                      parse_metrics, metrics_to_dict)
 
@@ -828,25 +827,6 @@ def get_gpu_state(smu, virt):
         'gfxclk': gfxclk, 'gfxclk2': gfxclk2,
         'metrics_ppt': metrics_ppt, 'temp': temp,
     }
-
-
-def read_ecc_info_from_hw(hw):
-    """Read ECC counters from SMU via table transfer.
-
-    Uses the driver's pre-configured DRAM buffer (same as OD/metrics).
-
-    Args:
-        hw: Hardware dict from init_hardware() (needs smu, virt).
-
-    Returns:
-        (EccInfoTable_t, raw_bytes) if successful,
-        (None, None) if not supported or on failure.
-    """
-    smu = hw.get("smu")
-    virt = hw.get("virt")
-    if smu is None or virt is None:
-        return None, None
-    return _ecc.read_ecc_info(smu, virt)
 
 
 def get_dpm_ranges(smu):
@@ -1723,118 +1703,6 @@ def query_smu_state(smu):
 
     _elog(f"query_smu_state: returned {len(state)} keys")
     return state
-
-
-def apply_smu_full(smu, smu_params, progress_callback=None):
-    """Apply clock-limit, PPT, and feature-mask SMU settings.
-
-    Controls (GfxOff, DCS, Workload, Throttler, TempInput, FwDstates,
-    DcsArch) are handled by individual per-row Set buttons in the
-    Controls sub-tab and are **not** sent here.
-
-    Args:
-        smu: SmuCmd instance.
-        smu_params: dict of SMU parameter key -> value.
-            Frequency keys: SMU_{CLK}_{SoftMin|SoftMax|HardMin|HardMax} (int, 0=skip)
-            SMU_PptLimit (int, 0=skip)
-            features_enable_mask (int, 0=skip)
-            features_disable_mask (int, 0=skip)
-        progress_callback: optional (pct, msg) callback for logging.
-
-    Returns dict of per-command results.
-    """
-    _elog(f"apply_smu_full: params={smu_params}")
-    results = {}
-
-    def _log(msg):
-        _elog(msg)
-        if progress_callback:
-            progress_callback(0, msg)
-
-    _CLK_DOMAINS = {
-        "GFXCLK": PPCLK.GFXCLK, "SOCCLK": PPCLK.SOCCLK,
-        "UCLK": PPCLK.UCLK, "FCLK": PPCLK.FCLK,
-        "DCLK0": PPCLK.DCLK0, "VCLK0": PPCLK.VCLK0,
-        "DISPCLK": PPCLK.DISPCLK, "DPPCLK": PPCLK.DPPCLK,
-        "DPREFCLK": PPCLK.DPREFCLK, "DCFCLK": PPCLK.DCFCLK,
-        "DTBCLK": PPCLK.DTBCLK,
-    }
-    _LIMIT_MSGS = [
-        ("SoftMin", PPSMC.SetSoftMinByFreq),
-        ("SoftMax", PPSMC.SetSoftMaxByFreq),
-        ("HardMin", PPSMC.SetHardMinByFreq),
-        ("HardMax", PPSMC.SetHardMaxByFreq),
-    ]
-
-    for clk_name, clk_id in _CLK_DOMAINS.items():
-        for limit_type, msg_id in _LIMIT_MSGS:
-            key = f"SMU_{clk_name}_{limit_type}"
-            val = smu_params.get(key, 0)
-            if val and val > 0:
-                param = ((clk_id & 0xFFFF) << 16) | (val & 0xFFFF)
-                try:
-                    resp, _ = smu.send_msg(msg_id, param)
-                    results[key] = resp
-                    _log(f"SMU: {clk_name} {limit_type} = {val} MHz")
-                except Exception as e:
-                    results[key] = str(e)
-
-    ppt = smu_params.get("SMU_PptLimit", 0)
-    if ppt > 0:
-        try:
-            resp, _ = smu.send_msg(PPSMC.SetPptLimit, ppt)
-            results["SMU_PptLimit"] = resp
-            _log(f"SMU: PPT Limit = {ppt} W")
-        except Exception as e:
-            results["SMU_PptLimit"] = str(e)
-
-    enable_mask = smu_params.get("features_enable_mask", 0)
-    disable_mask = smu_params.get("features_disable_mask", 0)
-    enable_mask_high = smu_params.get("features_enable_mask_high", 0)
-    disable_mask_high = smu_params.get("features_disable_mask_high", 0)
-
-    if enable_mask:
-        try:
-            _elog(f"apply_smu_full: EnableSmuFeaturesLow mask=0x{enable_mask:08X}")
-            resp, _ = smu.send_msg(PPSMC.EnableSmuFeaturesLow, enable_mask)
-            results["EnableFeatures"] = resp
-            _log(f"SMU: Enable features low = 0x{enable_mask:08X}")
-        except Exception as e:
-            _elog(f"apply_smu_full: EnableFeatures failed: {e}")
-            results["EnableFeatures"] = str(e)
-
-    if disable_mask:
-        try:
-            _elog(f"apply_smu_full: DisableSmuFeaturesLow mask=0x{disable_mask:08X}")
-            resp, _ = smu.send_msg(PPSMC.DisableSmuFeaturesLow, disable_mask)
-            results["DisableFeatures"] = resp
-            _log(f"SMU: Disable features low = 0x{disable_mask:08X}")
-        except Exception as e:
-            _elog(f"apply_smu_full: DisableFeatures failed: {e}")
-            results["DisableFeatures"] = str(e)
-
-    if enable_mask_high:
-        try:
-            _elog(f"apply_smu_full: EnableSmuFeaturesHigh mask=0x{enable_mask_high:08X}")
-            resp, _ = smu.send_msg(PPSMC.EnableSmuFeaturesHigh, enable_mask_high)
-            results["EnableFeaturesHigh"] = resp
-            _log(f"SMU: Enable features high = 0x{enable_mask_high:08X}")
-        except Exception as e:
-            _elog(f"apply_smu_full: EnableFeaturesHigh failed: {e}")
-            results["EnableFeaturesHigh"] = str(e)
-
-    if disable_mask_high:
-        try:
-            _elog(f"apply_smu_full: DisableSmuFeaturesHigh mask=0x{disable_mask_high:08X}")
-            resp, _ = smu.send_msg(PPSMC.DisableSmuFeaturesHigh, disable_mask_high)
-            results["DisableFeaturesHigh"] = resp
-            _log(f"SMU: Disable features high = 0x{disable_mask_high:08X}")
-        except Exception as e:
-            _elog(f"apply_smu_full: DisableFeaturesHigh failed: {e}")
-            results["DisableFeaturesHigh"] = str(e)
-
-    _elog(f"apply_smu_full: completed, results={results}")
-    return results
 
 
 def apply_od_settings(smu, virt, settings):

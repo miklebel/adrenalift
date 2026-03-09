@@ -173,6 +173,56 @@ def read_registry_values(
     return out
 
 
+def write_registry_binary(key_path: str, name: str, data: bytes) -> bool:
+    """
+    Write a REG_BINARY value under HKLM\\<key_path>.
+
+    Args:
+        key_path: Registry path relative to HKEY_LOCAL_MACHINE
+                  (e.g. ``SYSTEM\\...\\Class\\{guid}\\0000``).
+        name:     Value name (e.g. ``PP_PhmSoftPowerPlayTable``).
+        data:     Raw bytes to store.
+
+    Returns:
+        True on success, False on failure or non-Windows.
+    """
+    if winreg is None:
+        return False
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE, key_path, 0, winreg.KEY_SET_VALUE
+        ) as k:
+            winreg.SetValueEx(k, name, 0, winreg.REG_BINARY, data)
+        return True
+    except OSError:
+        return False
+
+
+def delete_registry_value(key_path: str, name: str) -> bool:
+    """
+    Delete a named value from HKLM\\<key_path>.
+
+    Args:
+        key_path: Registry path relative to HKEY_LOCAL_MACHINE.
+        name:     Value name to delete.
+
+    Returns:
+        True if the value was deleted (or already absent), False on error.
+    """
+    if winreg is None:
+        return False
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE, key_path, 0, winreg.KEY_SET_VALUE
+        ) as k:
+            winreg.DeleteValue(k, name)
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
 def find_display_adapter_class_keys(
     vendor_id: Union[int, str],
     device_id: Union[int, str],

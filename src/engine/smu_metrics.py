@@ -79,6 +79,30 @@ TEMP_NAMES = [
 
 D3HOT_SEQUENCE_NAMES = ["BACO", "MSR", "BAMACO", "ULPS"]
 
+THROTTLER_NAMES = [
+    "Temp_Edge",         # 0
+    "Temp_Hotspot",      # 1
+    "Temp_Hotspot_GFX",  # 2
+    "Temp_Hotspot_SOC",  # 3
+    "Temp_Mem",          # 4
+    "Temp_VR_GFX",       # 5
+    "Temp_VR_SOC",       # 6
+    "Temp_VR_Mem0",      # 7
+    "Temp_VR_Mem1",      # 8
+    "Temp_Liquid0",      # 9
+    "Temp_Liquid1",      # 10
+    "Temp_PLX",          # 11
+    "TDC_GFX",           # 12
+    "TDC_SOC",           # 13
+    "PPT0",              # 14
+    "PPT1",              # 15
+    "PPT2",              # 16
+    "PPT3",              # 17
+    "FIT",               # 18
+    "GFX_APCC_Plus",     # 19
+    "GFX_DVO",           # 20
+]
+
 
 # ---------------------------------------------------------------------------
 # ctypes struct -- mirrors SmuMetrics_t from smu14_driver_if_v14_0.h
@@ -264,7 +288,8 @@ def metrics_to_dict(m: SmuMetrics_t) -> dict:
     d["AvgFanRpm"]                           = m.AvgFanRpm
 
     for i in range(THROTTLER_COUNT):
-        d[f"ThrottlingPercentage_{i}"]       = m.ThrottlingPercentage[i]
+        name = THROTTLER_NAMES[i] if i < len(THROTTLER_NAMES) else str(i)
+        d[f"Throttle_{name}"]               = m.ThrottlingPercentage[i]
     d["VmaxThrottlingPercentage"]            = m.VmaxThrottlingPercentage
 
     for i, name in enumerate(D3HOT_SEQUENCE_NAMES):
