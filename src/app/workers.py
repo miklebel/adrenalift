@@ -333,11 +333,12 @@ class ScanThread(QThread):
     progress_signal = Signal(float, str)  # pct, msg
     finished_signal = Signal(object)  # ScanResult or None on error
 
-    def __init__(self, get_vbios_fn, *, merge_with_addrs=None, default_vbios_path=None, parent=None):
+    def __init__(self, get_vbios_fn, *, merge_with_addrs=None, default_vbios_path=None, num_threads=0, parent=None):
         super().__init__(parent)
         self.get_vbios_fn = get_vbios_fn
         self.merge_with_addrs = list(merge_with_addrs or [])
         self.default_vbios_path = default_vbios_path
+        self.num_threads = num_threads
 
     def run(self):
         _log_to_file("ScanThread: starting")
@@ -364,6 +365,7 @@ class ScanThread(QThread):
                 clock=vbios_values.gameclock_ac,
             )
             scan_opts = ScanOptions()
+            scan_opts.num_threads = self.num_threads
 
             def on_progress(pct: float, msg: str):
                 self.progress_signal.emit(pct, msg)

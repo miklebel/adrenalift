@@ -9,6 +9,14 @@ Main application window with:
 
 from __future__ import annotations
 
+# CRITICAL: On Windows + PyInstaller, multiprocessing child processes re-execute
+# this entry-point script.  Call freeze_support() BEFORE any module-level side
+# effects (logging, atexit, Qt) so child workers exit immediately instead of
+# spawning duplicate GUI instances (fork bomb).
+import multiprocessing as _mp
+if __name__ == "__main__":
+    _mp.freeze_support()
+
 import atexit
 import faulthandler
 import json
@@ -496,6 +504,16 @@ class MainOverclockWidget(QWidget):
         self.scan_status_label.setStyleSheet("color: #888; font-size: 9pt;")
         scan_row.addWidget(self.scan_status_label)
         scan_row.addStretch()
+        scan_workers_label = QLabel("Workers:")
+        scan_workers_label.setStyleSheet("font-size: 9pt;")
+        scan_row.addWidget(scan_workers_label)
+        self.scan_workers_spin = QSpinBox()
+        self.scan_workers_spin.setRange(1, 32)
+        self.scan_workers_spin.setValue(min(4, os.cpu_count() or 4))
+        self.scan_workers_spin.setToolTip(
+            "Number of scan worker threads. More workers = faster scan but heavier system load."
+        )
+        scan_row.addWidget(self.scan_workers_spin)
         self.rescan_btn = QPushButton("Scan")
         self.rescan_btn.setToolTip("Scan memory for PPTable addresses")
         self.rescan_btn.clicked.connect(self._on_rescan)
@@ -600,8 +618,11 @@ class MainOverclockWidget(QWidget):
             lambda: _get_vbios_values(),
             merge_with_addrs=existing,
             default_vbios_path=DEFAULT_VBIOS_PATH,
+            num_threads=self.scan_workers_spin.value(),
         )
-        self._scan_thread.progress_signal.connect(self._on_scan_progress)
+        self._scan_thread.progress_signal.connect(
+            self._on_scan_progress, Qt.ConnectionType.QueuedConnection
+        )
         self._scan_thread.finished_signal.connect(self._on_scan_finished)
         self._scan_thread.start()
         if existing:
@@ -851,7 +872,9 @@ class MainOverclockWidget(QWidget):
             lambda: _get_vbios_values(),
             default_vbios_path=DEFAULT_VBIOS_PATH,
         )
-        self._vram_scan_worker.progress_signal.connect(self._on_vram_scan_progress)
+        self._vram_scan_worker.progress_signal.connect(
+            self._on_vram_scan_progress, Qt.ConnectionType.QueuedConnection
+        )
         self._vram_scan_worker.finished_signal.connect(self._on_vram_scan_finished)
         self._vram_scan_worker.log_signal.connect(
             self._log_gui, Qt.ConnectionType.QueuedConnection

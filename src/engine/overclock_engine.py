@@ -24,10 +24,11 @@ Safe: Non-persistent.  Reboot always restores stock values.
 
 import json
 import logging
+import multiprocessing as mp
 import sys, os, ctypes, struct, time, threading, traceback
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 if getattr(sys, "frozen", False):
     _project_root = os.path.dirname(sys.executable)
@@ -242,13 +243,6 @@ def _map_progress(cb, lo, hi):
     def mapped(pct, msg):
         cb(lo + pct * (hi - lo) / 100.0, msg)
     return mapped
-
-
-def _resolve_scan_threads(num_threads):
-    if num_threads and num_threads > 0:
-        return num_threads
-    cpu = os.cpu_count() or 8
-    return max(8, min(32, cpu * 2))
 
 
 # ---------------------------------------------------------------------------
@@ -635,9 +629,88 @@ def validated_patch_u16(inpout, phys_addr, offset, expected_old, new_val):
 # Memory scanning primitives
 # ---------------------------------------------------------------------------
 
+_YIELD_EVERY = 8     # chunks between GIL yields per thread
+_YIELD_SECS  = 0.002 # 2 ms yield — enough for Qt event processing
+
+# -- Multiprocessing worker state (per-process globals) -----------------------
+
+_mp_inpout = None
+_mp_progress = None
+
+
+def _mp_init_worker(dll_path, progress_counter):
+    """Per-process initializer: load InpOut32 and store shared counter."""
+    global _mp_inpout, _mp_progress
+    _mp_inpout = InpOut32(dll_path=dll_path)
+    _mp_progress = progress_counter
+
+
+def _mp_scan_range(indices, patterns):
+    """Scan a range of chunk indices in a worker process."""
+    local_found = []
+    for ci in indices:
+        phys_base = ci * CHUNK_SIZE
+        try:
+            virt, handle = _mp_inpout.map_phys(phys_base, CHUNK_SIZE)
+        except (IOError, OSError):
+            with _mp_progress.get_lock():
+                _mp_progress.value += 1
+            continue
+        try:
+            buf = (ctypes.c_ubyte * CHUNK_SIZE)()
+            ctypes.memmove(buf, virt, CHUNK_SIZE)
+            data = bytes(buf)
+            for pattern in patterns:
+                pos = 0
+                while True:
+                    idx = data.find(pattern, pos)
+                    if idx < 0:
+                        break
+                    local_found.append((phys_base + idx, pattern))
+                    pos = idx + 2
+        finally:
+            _mp_inpout.unmap_phys(virt, handle)
+        with _mp_progress.get_lock():
+            _mp_progress.value += 1
+    return local_found
+
+
+def _mp_scan_range_windows(phys_bases, patterns):
+    """Scan physical base addresses in a worker process (window scan)."""
+    local_found = []
+    for phys_base in phys_bases:
+        try:
+            virt, handle = _mp_inpout.map_phys(phys_base, CHUNK_SIZE)
+        except (IOError, OSError):
+            with _mp_progress.get_lock():
+                _mp_progress.value += 1
+            continue
+        try:
+            buf = (ctypes.c_ubyte * CHUNK_SIZE)()
+            ctypes.memmove(buf, virt, CHUNK_SIZE)
+            data = bytes(buf)
+            for pattern in patterns:
+                pos = 0
+                while True:
+                    idx = data.find(pattern, pos)
+                    if idx < 0:
+                        break
+                    local_found.append((phys_base + idx, pattern))
+                    pos = idx + 2
+        finally:
+            _mp_inpout.unmap_phys(virt, handle)
+        with _mp_progress.get_lock():
+            _mp_progress.value += 1
+    return local_found
+
+
 def scan_memory(inpout, patterns, max_gb=16, num_threads=0,
                 progress_callback=None):
-    """Scan physical memory for byte patterns using parallel threads.
+    """Scan physical memory for byte patterns using worker processes.
+
+    Uses ProcessPoolExecutor for true CPU parallelism -- each worker runs
+    in its own process with its own GIL and InpOut32 DLL handle.  Falls
+    back to ThreadPoolExecutor if process spawning fails.
 
     Returns list of (phys_addr, matched_pattern) tuples.
     progress_callback(pct, msg) is called periodically during the scan.
@@ -656,55 +729,94 @@ def scan_memory(inpout, patterns, max_gb=16, num_threads=0,
         chunk_indices.append(ci)
 
     scannable = len(chunk_indices)
-    lock = threading.Lock()
-    progress = [0]
-    t0 = time.perf_counter()
 
-    def _scan_range(indices):
-        local_found = []
-        for ci in indices:
-            phys_base = ci * CHUNK_SIZE
-            try:
-                virt, handle = inpout.map_phys(phys_base, CHUNK_SIZE)
-            except (IOError, OSError):
-                with lock:
-                    progress[0] += 1
-                continue
-            try:
-                buf = (ctypes.c_ubyte * CHUNK_SIZE)()
-                ctypes.memmove(buf, virt, CHUNK_SIZE)
-                data = bytes(buf)
-                for pattern in patterns:
-                    pos = 0
-                    while True:
-                        idx = data.find(pattern, pos)
-                        if idx < 0:
-                            break
-                        local_found.append((phys_base + idx, pattern))
-                        pos = idx + 2
-            finally:
-                inpout.unmap_phys(virt, handle)
-
-            with lock:
-                progress[0] += 1
-                done = progress[0]
-            if done % 64 == 0 or done == scannable:
-                pct = done / scannable * 100
-                gb = done * CHUNK_SIZE / (1024 ** 3)
-                cb(pct, f"{pct:.1f}% ({gb:.1f} GB scanned)")
-        return local_found
-
-    num_threads = _resolve_scan_threads(num_threads)
-    per_thread = (scannable + num_threads - 1) // num_threads
+    if num_threads and num_threads > 0:
+        num_workers = num_threads
+    else:
+        num_workers = max(1, min(4, (os.cpu_count() or 4)))
+    per_thread = (scannable + num_workers - 1) // num_workers
     ranges = [chunk_indices[i * per_thread:(i + 1) * per_thread]
-              for i in range(num_threads)]
+              for i in range(num_workers)]
     ranges = [r for r in ranges if r]
 
-    all_found = []
-    with ThreadPoolExecutor(max_workers=len(ranges)) as pool:
-        futures = [pool.submit(_scan_range, r) for r in ranges]
-        for fut in as_completed(futures):
-            all_found.extend(fut.result())
+    t0 = time.perf_counter()
+
+    try:
+        dll_path = inpout._dll._name
+        shared_progress = mp.Value('i', 0)
+
+        all_found = []
+        with ProcessPoolExecutor(
+            max_workers=len(ranges),
+            initializer=_mp_init_worker,
+            initargs=(dll_path, shared_progress),
+        ) as pool:
+            futures = [pool.submit(_mp_scan_range, r, patterns)
+                       for r in ranges]
+
+            while not all(f.done() for f in futures):
+                done = shared_progress.value
+                if done > 0:
+                    pct = done / scannable * 100
+                    gb = done * CHUNK_SIZE / (1024 ** 3)
+                    cb(pct, f"{pct:.1f}% ({gb:.1f} GB scanned)")
+                time.sleep(0.15)
+
+            for fut in futures:
+                all_found.extend(fut.result())
+
+    except Exception as exc:
+        _elog(f"ProcessPoolExecutor failed ({exc}), falling back to threads")
+
+        lock = threading.Lock()
+        progress = [0]
+
+        def _scan_range(indices):
+            local_found = []
+            batch = 0
+            for ci in indices:
+                phys_base = ci * CHUNK_SIZE
+                try:
+                    virt, handle = inpout.map_phys(phys_base, CHUNK_SIZE)
+                except (IOError, OSError):
+                    with lock:
+                        progress[0] += 1
+                    continue
+                try:
+                    buf = (ctypes.c_ubyte * CHUNK_SIZE)()
+                    ctypes.memmove(buf, virt, CHUNK_SIZE)
+                    data = bytes(buf)
+                    for pattern in patterns:
+                        pos = 0
+                        while True:
+                            idx = data.find(pattern, pos)
+                            if idx < 0:
+                                break
+                            local_found.append((phys_base + idx, pattern))
+                            pos = idx + 2
+                finally:
+                    inpout.unmap_phys(virt, handle)
+
+                with lock:
+                    progress[0] += 1
+                    done = progress[0]
+                batch += 1
+
+                if done % 8 == 0 or done == scannable:
+                    pct = done / scannable * 100
+                    gb = done * CHUNK_SIZE / (1024 ** 3)
+                    cb(pct, f"{pct:.1f}% ({gb:.1f} GB scanned)")
+
+                if batch % _YIELD_EVERY == 0:
+                    time.sleep(_YIELD_SECS)
+
+            return local_found
+
+        all_found = []
+        with ThreadPoolExecutor(max_workers=len(ranges)) as pool:
+            futures = [pool.submit(_scan_range, r) for r in ranges]
+            for fut in as_completed(futures):
+                all_found.extend(fut.result())
 
     seen = set()
     deduped = []
@@ -716,14 +828,18 @@ def scan_memory(inpout, patterns, max_gb=16, num_threads=0,
     elapsed = time.perf_counter() - t0
     total_gb = scannable * CHUNK_SIZE / (1024 ** 3)
     cb(100, f"Done: {len(deduped)} match(es) in {elapsed:.1f}s "
-       f"[{len(ranges)} threads, {total_gb:.1f} GB]")
+       f"[{num_workers} workers, {total_gb:.1f} GB]")
     return deduped
 
 
 def scan_memory_windows(inpout, patterns, centers, window_mb=512,
                         max_centers=None, num_threads=0,
                         progress_callback=None):
-    """Scan small windows around candidate physical addresses."""
+    """Scan small windows around candidate physical addresses.
+
+    Uses ProcessPoolExecutor for true CPU parallelism.  Falls back to
+    ThreadPoolExecutor if process spawning fails.
+    """
     if isinstance(patterns, bytes):
         patterns = [patterns]
     cb = progress_callback or _noop_cb
@@ -747,55 +863,94 @@ def scan_memory_windows(inpout, patterns, centers, window_mb=512,
         return []
 
     chunk_list = sorted(chunks)
-    num_threads = _resolve_scan_threads(num_threads)
-    lock = threading.Lock()
-    progress = [0]
     total = len(chunk_list)
-    t0 = time.perf_counter()
 
-    def _scan_range(phys_ranges):
-        local = []
-        for phys_base in phys_ranges:
-            try:
-                virt, handle = inpout.map_phys(phys_base, CHUNK_SIZE)
-            except (IOError, OSError):
-                with lock:
-                    progress[0] += 1
-                continue
-            try:
-                buf = (ctypes.c_ubyte * CHUNK_SIZE)()
-                ctypes.memmove(buf, virt, CHUNK_SIZE)
-                data = bytes(buf)
-                for pattern in patterns:
-                    pos = 0
-                    while True:
-                        idx = data.find(pattern, pos)
-                        if idx < 0:
-                            break
-                        local.append((phys_base + idx, pattern))
-                        pos = idx + 2
-            finally:
-                inpout.unmap_phys(virt, handle)
-
-            with lock:
-                progress[0] += 1
-                done = progress[0]
-            if done % 64 == 0 or done == total:
-                pct = done / total * 100
-                gb = done * CHUNK_SIZE / (1024 ** 3)
-                cb(pct, f"Window scan: {gb:.1f} GB")
-        return local
-
-    per_thread = (total + num_threads - 1) // num_threads
+    if num_threads and num_threads > 0:
+        num_workers = num_threads
+    else:
+        num_workers = max(1, min(4, (os.cpu_count() or 4)))
+    per_thread = (total + num_workers - 1) // num_workers
     ranges = [chunk_list[i * per_thread:(i + 1) * per_thread]
-              for i in range(num_threads)]
+              for i in range(num_workers)]
     ranges = [r for r in ranges if r]
 
-    found = []
-    with ThreadPoolExecutor(max_workers=len(ranges)) as pool:
-        futures = [pool.submit(_scan_range, r) for r in ranges]
-        for fut in as_completed(futures):
-            found.extend(fut.result())
+    t0 = time.perf_counter()
+
+    try:
+        dll_path = inpout._dll._name
+        shared_progress = mp.Value('i', 0)
+
+        found = []
+        with ProcessPoolExecutor(
+            max_workers=len(ranges),
+            initializer=_mp_init_worker,
+            initargs=(dll_path, shared_progress),
+        ) as pool:
+            futures = [pool.submit(_mp_scan_range_windows, r, patterns)
+                       for r in ranges]
+
+            while not all(f.done() for f in futures):
+                done = shared_progress.value
+                if done > 0:
+                    pct = done / total * 100
+                    gb = done * CHUNK_SIZE / (1024 ** 3)
+                    cb(pct, f"Window scan: {gb:.1f} GB")
+                time.sleep(0.15)
+
+            for fut in futures:
+                found.extend(fut.result())
+
+    except Exception as exc:
+        _elog(f"ProcessPoolExecutor failed ({exc}), falling back to threads")
+
+        lock = threading.Lock()
+        progress = [0]
+
+        def _scan_range(phys_ranges):
+            local = []
+            batch = 0
+            for phys_base in phys_ranges:
+                try:
+                    virt, handle = inpout.map_phys(phys_base, CHUNK_SIZE)
+                except (IOError, OSError):
+                    with lock:
+                        progress[0] += 1
+                    continue
+                try:
+                    buf = (ctypes.c_ubyte * CHUNK_SIZE)()
+                    ctypes.memmove(buf, virt, CHUNK_SIZE)
+                    data = bytes(buf)
+                    for pattern in patterns:
+                        pos = 0
+                        while True:
+                            idx = data.find(pattern, pos)
+                            if idx < 0:
+                                break
+                            local.append((phys_base + idx, pattern))
+                            pos = idx + 2
+                finally:
+                    inpout.unmap_phys(virt, handle)
+
+                with lock:
+                    progress[0] += 1
+                    done = progress[0]
+                batch += 1
+
+                if done % 8 == 0 or done == total:
+                    pct = done / total * 100
+                    gb = done * CHUNK_SIZE / (1024 ** 3)
+                    cb(pct, f"Window scan: {gb:.1f} GB")
+
+                if batch % _YIELD_EVERY == 0:
+                    time.sleep(_YIELD_SECS)
+
+            return local
+
+        found = []
+        with ThreadPoolExecutor(max_workers=len(ranges)) as pool:
+            futures = [pool.submit(_scan_range, r) for r in ranges]
+            for fut in as_completed(futures):
+                found.extend(fut.result())
 
     seen = set()
     deduped = []
@@ -807,7 +962,7 @@ def scan_memory_windows(inpout, patterns, centers, window_mb=512,
     elapsed = time.perf_counter() - t0
     total_gb = total * CHUNK_SIZE / (1024 ** 3)
     cb(100, f"Window scan done: {len(deduped)} match(es) in {elapsed:.2f}s "
-       f"[{total_gb:.2f} GB, {len(ranges)} threads]")
+       f"[{total_gb:.2f} GB, {len(ranges)} workers]")
     return deduped
 
 
@@ -1243,7 +1398,7 @@ def vram_scan_for_dma(smu, inpout, vram_bar, vbios_values=None,
             chunk_sz = min(CHUNK, scan_limit - chunk_base)
 
             pct = 8 + (ci / total_chunks) * 82  # progress 8-90%
-            if ci % 64 == 0 or ci == total_chunks - 1:
+            if ci % 4 == 0 or ci == total_chunks - 1:
                 scanned_mb = chunk_base / (1 << 20)
                 cb(pct, f"Scanning VRAM: {scanned_mb:.0f} / {scan_limit / (1 << 20):.0f} MB")
 
