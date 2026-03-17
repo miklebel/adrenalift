@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import atexit
 import faulthandler
+import gzip
+import json
 import logging
 import os
 import sys
@@ -28,6 +30,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QGroupBox,
+    QLineEdit,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -203,6 +206,7 @@ from src.engine.overclock_engine import (
     ScanOptions,
     ScanResult,
     cleanup_hardware,
+    detect_bar_size,
     init_hardware,
     apply_clocks_only,
     apply_msglimits_only,
@@ -211,6 +215,8 @@ from src.engine.overclock_engine import (
     apply_od_single_field,
     apply_smu_features_only,
     query_smu_state,
+    read_buf,
+    read_vram_start,
     scan_for_pptable,
     read_od,
     read_metrics,
@@ -219,6 +225,7 @@ from src.engine.overclock_engine import (
     read_u16,
     read_smu_metrics_full,
     read_smu_table_raw,
+    vram_scan_for_dma,
 )
 from src.engine.smu import PPSMC, PPCLK, SMU_FEATURE, _CLK_NAMES, _FEATURE_NAMES, _FEATURE_NAMES_LOW
 from src.engine.smu_metrics import (
@@ -227,6 +234,7 @@ from src.engine.smu_metrics import (
 )
 from src.engine.od_table import (
     TABLE_PPTABLE,
+    TABLE_SMU_METRICS,
     TABLE_DRIVER_INFO,
     TABLE_ECCINFO,
     PP_OD_FEATURE_GFX_VF_CURVE_BIT,
@@ -422,7 +430,8 @@ class ApplyWorker(QThread):
         _log_to_file(f"ApplyWorker[{self.action_name}]: starting")
         try:
             hw = init_hardware()
-            _log_to_file(f"ApplyWorker[{self.action_name}]: hardware initialized")
+            _log_to_file(f"ApplyWorker[{self.action_name}]: hardware initialized, "
+                         f"dma_path={hw['dma_path']}")
             result = self.apply_fn(hw)
             if isinstance(result, tuple) and len(result) == 2 and result[0] is False:
                 err = result[1]  # e.g. OD reject: (False, "Unsupported feature")
@@ -485,6 +494,7 @@ class MemoryRefreshWorker(QThread):
         _log_to_file(f"MemoryRefreshWorker: starting ({len(self.valid_addrs)} addrs)")
         try:
             hw = init_hardware()
+            _log_to_file(f"MemoryRefreshWorker: init OK, dma_path={hw['dma_path']}")
             inpout = hw["inpout"]
         except Exception:
             _log_exception_to_file("MemoryRefreshWorker init_hardware")
@@ -529,6 +539,7 @@ class MetricsRefreshWorker(QThread):
         hw = None
         try:
             hw = init_hardware()
+            _log_to_file(f"MetricsRefreshWorker: init OK, dma_path={hw['dma_path']}")
             _m, d = read_smu_metrics_full(hw["smu"], hw["virt"])
             if d:
                 self.results_signal.emit(d)
@@ -560,6 +571,7 @@ class SmuTableReadWorker(QThread):
         hw = None
         try:
             hw = init_hardware()
+            _log_to_file(f"SmuTableReadWorker: init OK, dma_path={hw['dma_path']}")
             resp, raw = read_smu_table_raw(
                 hw["smu"], hw["virt"], self.table_id, self.read_size
             )
@@ -584,6 +596,7 @@ class DetailedRefreshWorker(QThread):
     """Background worker to read Live RAM (PPTable) and Live SMU (OD + metrics + full state) for Detailed tab."""
 
     results_signal = Signal(object, object, object, object)  # ram_data, od_table, metrics, smu_state
+    log_signal = Signal(str)
 
     def __init__(self, valid_addrs: list, pp_ram_offset_map: dict[str, dict] | None = None, parent=None):
         super().__init__(parent)
@@ -598,8 +611,8 @@ class DetailedRefreshWorker(QThread):
         hw = None
         _log_to_file("DetailedRefreshWorker: starting")
         try:
-            hw = init_hardware()
-            _log_to_file("DetailedRefreshWorker: init_hardware OK")
+            hw = init_hardware(gui_log=self.log_signal.emit)
+            _log_to_file(f"DetailedRefreshWorker: init OK, dma_path={hw['dma_path']}")
             inpout = hw["inpout"]
             smu = hw["smu"]
             virt = hw["virt"]
@@ -678,6 +691,7 @@ class ScanThread(QThread):
         hw = None
         try:
             hw = init_hardware()
+            _log_to_file(f"ScanThread: init OK, dma_path={hw['dma_path']}")
             inpout = hw["inpout"]
         except Exception as e:
             _log_exception_to_file("ScanThread init_hardware")
@@ -743,6 +757,166 @@ class ScanThread(QThread):
                 cleanup_hardware(hw)
 
 
+class VramDmaScanWorker(QThread):
+    """Background full-VRAM scan for the DMA buffer on ReBAR systems."""
+
+    progress_signal = Signal(float, str)   # pct 0-100, message
+    finished_signal = Signal(object)       # result dict or None
+    log_signal = Signal(str)               # GUI log messages
+
+    def __init__(self, get_vbios_fn, parent=None):
+        super().__init__(parent)
+        self.get_vbios_fn = get_vbios_fn
+
+    def run(self):
+        _log_to_file("VramDmaScanWorker: starting")
+        vbios_values = self.get_vbios_fn()
+        if vbios_values is None:
+            vbios_values = parse_vbios_or_defaults(DEFAULT_VBIOS_PATH)
+
+        hw = None
+        try:
+            hw = init_hardware(gui_log=self.log_signal.emit)
+            _log_to_file(f"VramDmaScanWorker: init OK, vram_bar=0x{hw['vram_bar']:X}")
+        except Exception as e:
+            _log_exception_to_file("VramDmaScanWorker init_hardware")
+            self.log_signal.emit(f"Hardware init failed: {e}")
+            self.finished_signal.emit(None)
+            return
+
+        try:
+            def on_progress(pct: float, msg: str):
+                self.progress_signal.emit(pct, msg)
+
+            result = vram_scan_for_dma(
+                hw["smu"],
+                hw["inpout"],
+                hw["vram_bar"],
+                vbios_values=vbios_values,
+                progress_callback=on_progress,
+            )
+            if result:
+                _log_to_file(f"VramDmaScanWorker: found offset=0x{result['offset']:X} "
+                             f"method={result['method']}")
+                self.log_signal.emit(
+                    f"VRAM scan found DMA buffer at offset 0x{result['offset']:X} "
+                    f"(method: {result['method']})")
+            else:
+                _log_to_file("VramDmaScanWorker: no DMA buffer found")
+                self.log_signal.emit("VRAM scan completed — DMA buffer not found")
+            self.finished_signal.emit(result)
+        except Exception as e:
+            _log_exception_to_file("VramDmaScanWorker")
+            self.log_signal.emit(f"VRAM scan failed: {e}")
+            self.finished_signal.emit(None)
+        finally:
+            if hw:
+                cleanup_hardware(hw)
+
+
+class VramDumpWorker(QThread):
+    """Background worker that dumps the visible VRAM BAR to a gzip-compressed file."""
+
+    progress_signal = Signal(float, str)      # (0..1, status message)
+    finished_signal = Signal(str, object)     # (file_path | error_msg, metadata_dict | None)
+
+    CHUNK = 0x400000  # 4 MB per read
+
+    def __init__(self, save_path: str, parent=None):
+        super().__init__(parent)
+        self.save_path = save_path
+
+    def run(self):
+        _log_to_file("VramDumpWorker: starting")
+        hw = None
+        t0 = time.time()
+        try:
+            self.progress_signal.emit(0.0, "Initializing hardware...")
+            hw = init_hardware()
+            inpout = hw["inpout"]
+            smu    = hw["smu"]
+            vram_bar = hw["vram_bar"]
+            dma_path = hw["dma_path"]
+            mmio   = hw["mmio"]
+
+            self.progress_signal.emit(0.0, "Detecting BAR size...")
+            bar_size = detect_bar_size(inpout, vram_bar)
+            if bar_size <= 0:
+                self.finished_signal.emit(
+                    "BAR size detection failed (0 bytes accessible)", None)
+                return
+
+            self.progress_signal.emit(0.0, "Triggering SMU metrics transfer...")
+            smu.send_msg(smu.transfer_read, TABLE_SMU_METRICS)
+            time.sleep(0.15)
+            smu.send_msg(smu.transfer_read, TABLE_SMU_METRICS)
+            time.sleep(0.15)
+
+            smu_ver = smu.get_smu_version()
+            vram_start, fb_raw = read_vram_start(mmio)
+
+            metadata = {
+                "vram_bar":          f"0x{vram_bar:X}",
+                "bar_size_bytes":    bar_size,
+                "bar_size_mb":       bar_size // (1 << 20),
+                "dma_path":          dma_path,
+                "smu_version":       list(smu_ver) if isinstance(smu_ver, tuple) else smu_ver,
+                "transfer_read":     f"0x{smu.transfer_read:02X}",
+                "mmhub_vram_start":  f"0x{vram_start:X}",
+                "mmhub_fb_raw":      f"0x{fb_raw:08X}",
+            }
+
+            dump_size = bar_size + 0x1000
+            total_chunks = max(1, (dump_size + self.CHUNK - 1) // self.CHUNK)
+            total_mb = dump_size // (1 << 20)
+            self.progress_signal.emit(0.0, f"Dumping {total_mb} MB...")
+
+            os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
+            with gzip.open(self.save_path, "wb", compresslevel=6) as gz:
+                for i in range(total_chunks):
+                    chunk_base = i * self.CHUNK
+                    chunk_sz = min(self.CHUNK, dump_size - chunk_base)
+                    try:
+                        cv, ch = inpout.map_phys(vram_bar + chunk_base, chunk_sz)
+                        snap = read_buf(cv, chunk_sz)
+                        inpout.unmap_phys(cv, ch)
+                        gz.write(snap)
+                    except Exception as e:
+                        _log_to_file(f"VramDumpWorker: chunk {i} @ 0x{chunk_base:X} failed: {e}")
+                        gz.write(b'\x00' * chunk_sz)
+
+                    pct = (i + 1) / total_chunks
+                    mb_done = min((i + 1) * self.CHUNK // (1 << 20), total_mb)
+                    self.progress_signal.emit(pct, f"Dumped {mb_done} / {total_mb} MB")
+
+            elapsed = time.time() - t0
+            compressed_size = os.path.getsize(self.save_path)
+            metadata["dump_size_bytes"]       = dump_size
+            metadata["compressed_size_bytes"] = compressed_size
+            metadata["elapsed_seconds"]       = round(elapsed, 2)
+
+            sidecar_path = self.save_path.rsplit(".bin.gz", 1)[0] + ".meta.json" \
+                if self.save_path.endswith(".bin.gz") \
+                else self.save_path + ".meta.json"
+            with open(sidecar_path, "w") as f:
+                json.dump(metadata, f, indent=2)
+
+            _log_to_file(
+                f"VramDumpWorker: completed in {elapsed:.1f}s, "
+                f"{compressed_size / (1 << 20):.1f} MB compressed")
+            self.finished_signal.emit(self.save_path, metadata)
+
+        except Exception as e:
+            _log_exception_to_file("VramDumpWorker")
+            self.finished_signal.emit(f"VRAM dump failed: {e}", None)
+        finally:
+            if hw:
+                try:
+                    cleanup_hardware(hw)
+                except Exception:
+                    _log_exception_to_file("VramDumpWorker cleanup")
+
+
 # ---------------------------------------------------------------------------
 # Main Overclock UI
 # ---------------------------------------------------------------------------
@@ -785,16 +959,19 @@ class MainOverclockWidget(QWidget):
         self.smu_tab = QWidget()
         self.memory_tab = QWidget()
         self.registry_tab = QWidget()
+        self.diag_tab = QWidget()
         self._setup_simple_tab()
         self._setup_detailed_tabs()
         self._setup_smu_tab()
         self._setup_memory_tab()
         self._setup_registry_tab()
+        self._setup_diagnostics_tab()
         self.tabs.addTab(self.simple_tab, "Simple Settings")
         self.tabs.addTab(self.pp_tab, "PP")
         self.tabs.addTab(self.smu_tab, "SMU")
         self.tabs.addTab(self.memory_tab, "Memory")
         self.tabs.addTab(self.registry_tab, "Registry Patch")
+        self.tabs.addTab(self.diag_tab, "Diagnostics")
         layout.addWidget(self.tabs)
 
         # Progress bar and scan status
@@ -815,6 +992,26 @@ class MainOverclockWidget(QWidget):
         self.rescan_btn.setEnabled(True)
         scan_row.addWidget(self.rescan_btn)
         layout.addLayout(scan_row)
+
+        self.vram_progress_bar = QProgressBar()
+        self.vram_progress_bar.setRange(0, 100)
+        self.vram_progress_bar.setValue(0)
+        self.vram_progress_bar.setTextVisible(True)
+        layout.addWidget(self.vram_progress_bar)
+
+        vram_scan_row = QHBoxLayout()
+        self.vram_status_label = QLabel(
+            "Ready — press VRAM Scan to find DMA buffer"
+        )
+        self.vram_status_label.setStyleSheet("color: #888; font-size: 9pt;")
+        vram_scan_row.addWidget(self.vram_status_label)
+        vram_scan_row.addStretch()
+        self.vram_scan_btn = QPushButton("VRAM Scan")
+        self.vram_scan_btn.setToolTip("Scan GPU VRAM for DMA buffer offset")
+        self.vram_scan_btn.setEnabled(True)
+        self.vram_scan_btn.clicked.connect(self._on_vram_scan)
+        vram_scan_row.addWidget(self.vram_scan_btn)
+        layout.addLayout(vram_scan_row)
 
         # Log panel
         log_label = QLabel("Log")
@@ -837,6 +1034,7 @@ class MainOverclockWidget(QWidget):
             self._log("VBIOS values loaded.")
 
         self._scan_thread = None
+        self._vram_scan_worker = None
         self._set_apply_buttons_enabled(False)
         self._apply_worker = None
 
@@ -1218,6 +1416,49 @@ rather than <i>against</i> you. Both are needed for a robust overclock.</p>
             self._update_memory_placeholder("No addresses")
         self.progress_bar.setValue(100)
         self.rescan_btn.setEnabled(True)
+
+    # ------------------------------------------------------------------
+    # VRAM DMA scan
+    # ------------------------------------------------------------------
+
+    def _on_vram_scan(self):
+        if self._vram_scan_worker is not None and self._vram_scan_worker.isRunning():
+            return
+        self.vram_scan_btn.setEnabled(False)
+        self.vram_progress_bar.setValue(0)
+        self.vram_status_label.setText("Scanning VRAM for DMA buffer...")
+        self._vram_scan_worker = VramDmaScanWorker(
+            lambda: _get_vbios_values(),
+        )
+        self._vram_scan_worker.progress_signal.connect(self._on_vram_scan_progress)
+        self._vram_scan_worker.finished_signal.connect(self._on_vram_scan_finished)
+        self._vram_scan_worker.log_signal.connect(
+            self._log_gui, Qt.ConnectionType.QueuedConnection
+        )
+        self._vram_scan_worker.start()
+        self._log("VRAM DMA scan started...")
+
+    def _on_vram_scan_progress(self, pct: float, msg: str):
+        self.vram_progress_bar.setValue(int(pct))
+        self.vram_status_label.setText(msg)
+
+    def _on_vram_scan_finished(self, result):
+        self.vram_scan_btn.setEnabled(True)
+        self.vram_progress_bar.setValue(100)
+        if result is not None:
+            offset = result.get("offset", 0)
+            method = result.get("method", "unknown")
+            vram_mb = result.get("vram_size", 0) / (1024 * 1024)
+            self.vram_status_label.setText(
+                f"Found DMA buffer at 0x{offset:X}  (method: {method})"
+            )
+            self._log(
+                f"VRAM scan complete: DMA buffer at offset 0x{offset:X} "
+                f"(method: {method}, VRAM: {vram_mb:.0f} MB)"
+            )
+        else:
+            self.vram_status_label.setText("VRAM scan finished — DMA buffer not found")
+            self._log("VRAM scan complete: DMA buffer not found.")
 
     def _setup_detailed_tabs(self):
         """Set up PP tab and OD sub-tab (OD is added to SMU inner tabs)."""
@@ -3586,6 +3827,190 @@ current registry value so you can tweak them manually.</p>
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
+    # ------------------------------------------------------------------
+    # Diagnostics tab
+    # ------------------------------------------------------------------
+
+    def _setup_diagnostics_tab(self):
+        """Diagnostics tab: VRAM BAR dump to compressed file for offline analysis."""
+        layout = QVBoxLayout(self.diag_tab)
+        self._diag_dump_worker: VramDumpWorker | None = None
+
+        header = QLabel("VRAM Dump — Compressed BAR snapshot for offline analysis")
+        header.setStyleSheet("font-weight: bold;")
+        header.setToolTip(
+            "Reads the entire GPU VRAM BAR through physical memory and saves it "
+            "as a gzip-compressed .bin.gz file with a JSON metadata sidecar.\n\n"
+            "Useful for ReBAR debugging — the dump captures the driver buffer, "
+            "PPTable copies, and SMU metrics data visible in the BAR.\n\n"
+            "Send the resulting files to the developer for offline analysis."
+        )
+        layout.addWidget(header)
+
+        help_btn = QToolButton()
+        help_btn.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxQuestion)
+        )
+        help_btn.setIconSize(QSize(16, 16))
+        help_btn.setToolTip("What does VRAM Dump do?")
+        help_btn.setStyleSheet("QToolButton { border: none; background: transparent; }")
+        help_btn.setCursor(Qt.CursorShape.WhatsThisCursor)
+        help_btn.clicked.connect(
+            lambda: self._show_smu_cheatsheet(
+                "VRAM Dump", self._DIAG_VRAM_DUMP_HTML))
+
+        help_row = QHBoxLayout()
+        help_row.addWidget(help_btn)
+        help_row.addWidget(QLabel("<b>What is this?</b>"))
+        help_row.addStretch()
+        layout.addLayout(help_row)
+
+        # Save path row
+        path_row = QHBoxLayout()
+        path_row.addWidget(QLabel("Save to:"))
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        if not os.path.isdir(desktop):
+            desktop = os.path.expanduser("~")
+        default_path = os.path.join(desktop, "vram_dump.bin.gz")
+        self.diag_save_path = QLineEdit(default_path)
+        self.diag_save_path.setReadOnly(True)
+        self.diag_save_path.setStyleSheet(
+            "background: #2a2a2a; color: #ccc; padding: 4px;")
+        path_row.addWidget(self.diag_save_path, stretch=1)
+        browse_btn = QPushButton("Browse...")
+        browse_btn.clicked.connect(self._on_diag_browse)
+        path_row.addWidget(browse_btn)
+        layout.addLayout(path_row)
+
+        # Start button
+        self.diag_start_btn = QPushButton("Start Dump")
+        self.diag_start_btn.setToolTip("Dump the full GPU VRAM BAR to the selected file")
+        self.diag_start_btn.clicked.connect(self._on_diag_start_dump)
+        layout.addWidget(self.diag_start_btn)
+
+        # Progress bar + status
+        self.diag_progress = QProgressBar()
+        self.diag_progress.setRange(0, 1000)
+        self.diag_progress.setValue(0)
+        self.diag_progress.setTextVisible(True)
+        layout.addWidget(self.diag_progress)
+
+        self.diag_status_label = QLabel("Idle")
+        self.diag_status_label.setStyleSheet("color: #888; font-size: 9pt;")
+        layout.addWidget(self.diag_status_label)
+
+        # Info group (hidden until dump completes)
+        self.diag_info_group = QGroupBox("Dump Info")
+        info_layout = QFormLayout(self.diag_info_group)
+        self.diag_info_bar_size = QLabel("—")
+        self.diag_info_compressed = QLabel("—")
+        self.diag_info_vram_bar = QLabel("—")
+        self.diag_info_dma_path = QLabel("—")
+        self.diag_info_duration = QLabel("—")
+        info_layout.addRow("BAR size:", self.diag_info_bar_size)
+        info_layout.addRow("Compressed size:", self.diag_info_compressed)
+        info_layout.addRow("VRAM BAR addr:", self.diag_info_vram_bar)
+        info_layout.addRow("DMA path:", self.diag_info_dma_path)
+        info_layout.addRow("Duration:", self.diag_info_duration)
+        self.diag_info_group.hide()
+        layout.addWidget(self.diag_info_group)
+
+        layout.addStretch()
+
+    _DIAG_VRAM_DUMP_HTML = """
+<h3>VRAM Dump — Full BAR Snapshot</h3>
+<p>This tool reads the entire GPU VRAM BAR (Base Address Register) aperture through
+physical memory mapping and saves it as a <b>gzip-compressed</b> <code>.bin.gz</code>
+file. A small JSON sidecar (<code>.meta.json</code>) is written alongside with
+hardware metadata.</p>
+
+<h4>What gets captured</h4>
+<ul>
+  <li>The driver's cached <b>PPTable</b> copies</li>
+  <li><b>SMU metrics</b> data (two fresh transfers are triggered before the dump)</li>
+  <li>The <b>DMA buffer</b> used for SMU table transfers</li>
+  <li>Any other data visible in the BAR aperture</li>
+</ul>
+
+<h4>When to use</h4>
+<ul>
+  <li><b>ReBAR debugging</b> &mdash; verify the full BAR is accessible and readable</li>
+  <li><b>Developer diagnostics</b> &mdash; send the .bin.gz + .meta.json to the developer
+      for offline analysis when something isn't working</li>
+  <li><b>Before/after comparison</b> &mdash; dump before and after applying patches to
+      verify changes in the BAR</li>
+</ul>
+
+<h4>Output files</h4>
+<ul>
+  <li><code>vram_dump.bin.gz</code> &mdash; Gzip-compressed raw BAR content</li>
+  <li><code>vram_dump.meta.json</code> &mdash; JSON with BAR size, addresses, SMU version,
+      MMHUB register values, timing, and compressed size</li>
+</ul>
+"""
+
+    def _on_diag_browse(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save VRAM dump", self.diag_save_path.text(),
+            "Compressed binary (*.bin.gz)")
+        if path:
+            if not path.endswith(".bin.gz"):
+                path += ".bin.gz"
+            self.diag_save_path.setText(path)
+
+    def _on_diag_start_dump(self):
+        if self._diag_dump_worker is not None and self._diag_dump_worker.isRunning():
+            return
+        save_path = self.diag_save_path.text().strip()
+        if not save_path:
+            self._log("Diagnostics: no save path selected.")
+            return
+
+        self.diag_start_btn.setEnabled(False)
+        self.diag_progress.setValue(0)
+        self.diag_status_label.setText("Starting...")
+        self.diag_status_label.setStyleSheet("color: #aaa; font-size: 9pt;")
+        self.diag_info_group.hide()
+
+        self._diag_dump_worker = VramDumpWorker(save_path, parent=self)
+        self._diag_dump_worker.progress_signal.connect(self._on_diag_progress)
+        self._diag_dump_worker.finished_signal.connect(self._on_diag_finished)
+        self._diag_dump_worker.finished.connect(
+            lambda: self.diag_start_btn.setEnabled(True))
+        self._diag_dump_worker.start()
+
+    def _on_diag_progress(self, fraction: float, message: str):
+        self.diag_progress.setValue(int(fraction * 1000))
+        self.diag_status_label.setText(message)
+
+    def _on_diag_finished(self, result_or_error: str, metadata: dict | None):
+        if metadata is None:
+            self.diag_status_label.setText(result_or_error)
+            self.diag_status_label.setStyleSheet("color: #f44; font-size: 9pt;")
+            self.diag_progress.setValue(0)
+            self._log(f"VRAM dump failed: {result_or_error}")
+            return
+
+        self.diag_progress.setValue(1000)
+        self.diag_status_label.setText(f"Done — saved to {result_or_error}")
+        self.diag_status_label.setStyleSheet("color: #4f4; font-size: 9pt;")
+
+        bar_mb = metadata.get("bar_size_mb", "?")
+        bar_bytes = metadata.get("bar_size_bytes", 0)
+        compressed = metadata.get("compressed_size_bytes", 0)
+        self.diag_info_bar_size.setText(f"{bar_mb} MB  ({bar_bytes:,} bytes)")
+        self.diag_info_compressed.setText(
+            f"{compressed / (1 << 20):.1f} MB  ({compressed:,} bytes)")
+        self.diag_info_vram_bar.setText(str(metadata.get("vram_bar", "?")))
+        self.diag_info_dma_path.setText(str(metadata.get("dma_path", "?")))
+        elapsed = metadata.get("elapsed_seconds", "?")
+        self.diag_info_duration.setText(f"{elapsed} s")
+        self.diag_info_group.show()
+
+        self._log(
+            f"VRAM dump complete: {bar_mb} MB BAR → "
+            f"{compressed / (1 << 20):.1f} MB compressed in {elapsed}s")
+
     def _on_reg_refresh(self):
         """Re-read registry and update table."""
         if self._reg_patch is None:
@@ -3875,6 +4300,7 @@ current registry value so you can tweak them manually.</p>
             pp_ram_offset_map=self._pp_ram_offset_map,
             parent=self,
         )
+        self._detailed_worker.log_signal.connect(self._log_gui, Qt.ConnectionType.QueuedConnection)
         self._detailed_worker.results_signal.connect(self._on_detailed_refresh_results)
         self._detailed_worker.finished.connect(lambda: self._enable_detailed_refresh())
         self._detailed_worker.start()

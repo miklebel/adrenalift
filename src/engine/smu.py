@@ -332,6 +332,8 @@ class SmuCmd:
         self._mmio = mmio
         self._verbose = verbose
         self._msg_count = 0  # Total messages sent
+        self.transfer_read  = PPSMC.TransferTableSmu2Dram       # 0x12 default (driver path)
+        self.transfer_write = PPSMC.TransferTableDram2Smu       # 0x13 default (driver path)
 
     # ---- Core message protocol ----
 
@@ -667,6 +669,12 @@ class SmuCmd:
         except (RuntimeError, TimeoutError):
             return None
 
+    # ---- HDP cache coherency ----
+
+    def hdp_flush(self):
+        """Flush+invalidate the HDP cache to ensure CPU/GPU coherency around DMA transfers."""
+        self._mmio.hdp_flush()
+
     # ---- DRAM table transfer ----
 
     def set_dram_addr(self, mc_addr, use_tools=True):
@@ -703,7 +711,7 @@ class SmuCmd:
             print(f"[SMU] {path} DRAM addr set: 0x{mc_addr:016X} "
                   f"(hi=0x{hi:08X}, lo=0x{lo:08X})")
 
-    def transfer_table_to_smu(self, table_id, use_tools=True):
+    def transfer_table_to_smu(self, table_id, use_tools=None):
         """
         Transfer a table from DRAM to SMU firmware.
 
@@ -713,22 +721,16 @@ class SmuCmd:
 
         Args:
             table_id:  Table identifier (e.g. TABLE_OVERDRIVE = 8).
-            use_tools: If True (default), use TransferTableDram2SmuWithAddr
-                       (0x53) which uses the Tools DRAM address.
-                       If False, use TransferTableDram2Smu (0x13) which
-                       uses the Driver DRAM address.
+            use_tools: Deprecated; ignored.  Always uses self.transfer_write
+                       (0x13 TransferTableDram2Smu by default, set during
+                       DMA buffer discovery).
 
         Raises:
             RuntimeError: If the transfer fails.
         """
-        if use_tools:
-            return self.send_msg_ok(PPSMC.TransferTableDram2SmuWithAddr,
-                                    table_id & 0xFFFF)
-        else:
-            return self.send_msg_ok(PPSMC.TransferTableDram2Smu,
-                                    table_id & 0xFFFF)
+        return self.send_msg_ok(self.transfer_write, table_id & 0xFFFF)
 
-    def transfer_table_from_smu(self, table_id, use_tools=True):
+    def transfer_table_from_smu(self, table_id, use_tools=None):
         """
         Transfer a table from SMU firmware to DRAM.
 
@@ -737,20 +739,14 @@ class SmuCmd:
 
         Args:
             table_id:  Table identifier (e.g. TABLE_OVERDRIVE = 8).
-            use_tools: If True (default), use TransferTableSmu2DramWithAddr
-                       (0x52) which uses the Tools DRAM address.
-                       If False, use TransferTableSmu2Dram (0x12) which
-                       uses the Driver DRAM address.
+            use_tools: Deprecated; ignored.  Always uses self.transfer_read
+                       (0x12 TransferTableSmu2Dram by default, set during
+                       DMA buffer discovery).
 
         Raises:
             RuntimeError: If the transfer fails.
         """
-        if use_tools:
-            return self.send_msg_ok(PPSMC.TransferTableSmu2DramWithAddr,
-                                    table_id & 0xFFFF)
-        else:
-            return self.send_msg_ok(PPSMC.TransferTableSmu2Dram,
-                                    table_id & 0xFFFF)
+        return self.send_msg_ok(self.transfer_read, table_id & 0xFFFF)
 
     # ---- Diagnostic / info dump ----
 

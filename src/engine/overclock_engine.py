@@ -22,6 +22,7 @@ printing directly, so callers control presentation.
 Safe: Non-persistent.  Reboot always restores stock values.
 """
 
+import json
 import logging
 import sys, os, ctypes, struct, time, threading, traceback
 from collections import Counter
@@ -61,7 +62,7 @@ from src.engine.smu_metrics import (SmuMetrics_t, SMU_METRICS_SIZE,
 # Constants
 # ---------------------------------------------------------------------------
 
-DRIVER_BUF_OFFSET = 0x0FBCC000
+DRIVER_BUF_OFFSET_DEFAULT = 0x0FBCC000
 
 ORIG_BASECLOCK_AC  = 1900
 ORIG_GAMECLOCK_AC  = 2780
@@ -93,6 +94,41 @@ ML_TEMP_HSSOC    = 26
 ML_TEMP_MEM      = 28
 ML_TEMP_VR_GFX   = 30
 ML_TEMP_VR_SOC   = 32
+
+
+# ---------------------------------------------------------------------------
+# DMA offset cache
+# ---------------------------------------------------------------------------
+
+_DMA_CACHE_PATH = os.path.join(_project_root, ".dma_offset_cache.json")
+
+
+def _load_dma_cache():
+    """Load cached DMA buffer offset from disk. Returns int or None."""
+    try:
+        with open(_DMA_CACHE_PATH, "r") as f:
+            data = json.load(f)
+        offset = data.get("offset")
+        if isinstance(offset, int) and offset > 0:
+            return offset
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
+        pass
+    return None
+
+
+def _save_dma_cache(offset: int, method: str):
+    """Persist the discovered DMA buffer offset to disk."""
+    try:
+        data = {
+            "offset": offset,
+            "method": method,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        with open(_DMA_CACHE_PATH, "w") as f:
+            json.dump(data, f, indent=2)
+        _elog(f"_save_dma_cache: wrote offset=0x{offset:X} method={method}")
+    except Exception as e:
+        _elog(f"_save_dma_cache: failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -248,11 +284,13 @@ def write_buf(virt, data):
 
 
 def read_od(smu, virt):
-    smu.send_msg(0x12, TABLE_OVERDRIVE)
+    smu.send_msg(smu.transfer_read, TABLE_OVERDRIVE)
+    smu.hdp_flush()
     raw = read_buf(virt, _OD_TABLE_SIZE)
     if struct.unpack_from('<I', raw, 0)[0] <= 0x1000:
         return OverDriveTable_t.from_buffer_copy(raw)
-    smu.send_msg(0x12, TABLE_OVERDRIVE)
+    smu.send_msg(smu.transfer_read, TABLE_OVERDRIVE)
+    smu.hdp_flush()
     raw = read_buf(virt, _OD_TABLE_SIZE)
     if struct.unpack_from('<I', raw, 0)[0] <= 0x1000:
         return OverDriveTable_t.from_buffer_copy(raw)
@@ -281,7 +319,8 @@ def extract_od_pattern(smu, virt, pattern_len=24):
 
 
 def read_metrics(smu, virt):
-    smu.send_msg(0x12, TABLE_SMU_METRICS)
+    smu.send_msg(smu.transfer_read, TABLE_SMU_METRICS)
+    smu.hdp_flush()
     raw = read_buf(virt, 256)
     gfxclk = struct.unpack_from('<H', raw, 0x48)[0]
     gfxclk2 = struct.unpack_from('<H', raw, 0x4A)[0]
@@ -308,7 +347,8 @@ def read_smu_metrics_full(smu, virt):
         tuple[SmuMetrics_t | None, dict]
     """
     try:
-        smu.send_msg(0x12, TABLE_SMU_METRICS)
+        smu.send_msg(smu.transfer_read, TABLE_SMU_METRICS)
+        smu.hdp_flush()
         raw = read_buf(virt, SMU_METRICS_SIZE)
         m = parse_metrics(raw)
         return m, metrics_to_dict(m)
@@ -335,7 +375,8 @@ def read_smu_table_raw(smu, virt, table_id, read_size=8192):
         (None, None) on failure.
     """
     try:
-        resp, ret = smu.send_msg(0x12, table_id)
+        resp, ret = smu.send_msg(smu.transfer_read, table_id)
+        smu.hdp_flush()
         raw = read_buf(virt, min(read_size, 0x3000))
         _elog(f"read_smu_table_raw: table_id={table_id} resp=0x{resp:X} "
               f"ret=0x{ret:X} read {len(raw)} bytes")
@@ -774,21 +815,696 @@ def scan_memory_windows(inpout, patterns, centers, window_mb=512,
 # High-level API
 # ---------------------------------------------------------------------------
 
-def init_hardware():
+def _validate_metrics_at(virt, smu, transfer_msg, table_id=TABLE_SMU_METRICS):
+    """Send a metrics transfer and check the result looks like real data.
+
+    Fills the buffer with a sentinel pattern first, sends the transfer,
+    waits briefly for DMA completion, then checks for valid metrics.
+    Returns True when MetricsCounter > 0 and GFXCLK is in 100-5000 MHz.
+    """
+    import time
+    try:
+        sentinel = bytes([0xAA] * 64)
+        write_buf(virt, sentinel)
+        smu.hdp_flush()
+
+        resp, _ = smu.send_msg(transfer_msg, table_id)
+        if resp != 1:
+            _elog(f"_validate: SMU resp=0x{resp:X} (not OK)")
+            return False
+
+        for attempt in range(3):
+            smu.hdp_flush()
+            if attempt > 0:
+                time.sleep(0.05 * (2 ** attempt))
+
+            raw = read_buf(virt, SMU_METRICS_SIZE)
+            head = raw[:16].hex()
+
+            still_sentinel = raw[:64] == sentinel
+            if not still_sentinel:
+                break
+        else:
+            _elog(f"_validate: FAILED — sentinel unchanged after 3 flush+read "
+                  f"attempts (DMA target wrong or HDP remap not active). "
+                  f"head={head}")
+            return False
+
+        m = parse_metrics(raw)
+        gfxclk = m.CurrClock[0]
+        mc = m.MetricsCounter
+        _elog(f"_validate: sentinel cleared on attempt {attempt}, head={head} "
+              f"MetricsCounter={mc} GFXCLK={gfxclk}")
+
+        if mc == 0:
+            _elog("_validate: FAILED — MetricsCounter=0")
+            return False
+        if not (100 <= gfxclk <= 5000):
+            _elog(f"_validate: FAILED — GFXCLK={gfxclk} out of range")
+            return False
+        return True
+    except Exception as e:
+        _elog(f"_validate: exception: {e}")
+        return False
+
+
+# SMN addresses for MMMC_VM_FB_LOCATION_BASE across MMHUB generations.
+# Register index 0x0554, base varies by IP version.  Byte addr = (base+0x554)*4.
+_FB_LOC_BASE_SMN_CANDIDATES = [
+    ("mmhub_v4.1_seg0", (0x0001A000 + 0x0554) * 4),   # 0x69550 -- dGPU RDNA1-4
+    ("mmhub_v4.1_seg2", (0x02408800 + 0x0554) * 4),   # RDNA3/4 alt segment
+    ("mmhub_apu_seg0",  (0x00013200 + 0x0554) * 4),   # APU (Yellow Carp etc.)
+]
+
+
+def _read_vram_start(mmio):
+    """Read gmc.vram_start from the MMHUB FB_LOCATION_BASE register via SMN.
+
+    Tries several candidate SMN addresses (varies by MMHUB IP version).
+    Returns (vram_start, raw_reg) or (0, 0) if unreadable.
+    """
+    for name, smn_addr in _FB_LOC_BASE_SMN_CANDIDATES:
+        try:
+            raw = mmio.smn_read32(smn_addr)
+            fb_base = (raw & 0x00FFFFFF) << 24
+            if raw != 0 and raw != 0xFFFFFFFF:
+                return fb_base, raw
+        except Exception as e:
+            _elog(f"_read_vram_start: {name} SMN 0x{smn_addr:X} failed: {e}")
+    return 0, 0
+
+
+def _write_read_test(inpout, vram_bar, offset):
+    """Write a marker to vram_bar+offset and read back. Returns True if OK."""
+    import struct as _st
+    phys = vram_bar + offset
+    try:
+        v, h = inpout.map_phys(phys, 0x1000)
+        marker = _st.pack('<I', 0xDEADBEEF)
+        write_buf(v, marker)
+        rb = read_buf(v, 4)
+        inpout.unmap_phys(v, h)
+        return rb == marker
+    except Exception:
+        return False
+
+
+def _detect_bar_size(inpout, vram_bar):
+    """Probe the BAR aperture size by write-read testing at power-of-2 offsets.
+
+    Returns the largest accessible offset (conservative lower bound for BAR size).
+    """
+    last_good = 0
+    for shift in range(20, 35):  # 1MB .. 16GB
+        offset = 1 << shift
+        if _write_read_test(inpout, vram_bar, offset):
+            last_good = offset
+        else:
+            break
+    _elog(f"_detect_bar: last_good_offset=0x{last_good:X} "
+          f"(~{last_good // (1 << 20)}MB BAR)")
+    return last_good
+
+
+_DISPLAY_CLASS_PATH = (
+    r"SYSTEM\CurrentControlSet\Control\Class"
+    r"\{4d36e968-e325-11ce-bfc1-08002be10318}"
+)
+_AMD_VENDOR_PREFIX = "VEN_1002"
+
+
+def _detect_vram_size(inpout=None, vram_bar=None):
+    """Return GPU VRAM size in bytes via the Windows registry.
+
+    Reads ``HardwareInformation.qwMemorySize`` (REG_QWORD) from each
+    numeric subkey of the Display adapter class key, selecting the first
+    AMD entry (MatchingDeviceId contains VEN_1002).
+
+    Falls back to ``_detect_bar_size()`` when the registry read fails
+    (non-Windows, missing key, permissions, etc.).
+    """
+    try:
+        import winreg
+    except ImportError:
+        _elog("_detect_vram_size: winreg unavailable, falling back to BAR probe")
+        if inpout is not None and vram_bar is not None:
+            return _detect_bar_size(inpout, vram_bar)
+        return 0
+
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE, _DISPLAY_CLASS_PATH, 0, winreg.KEY_READ
+        ) as parent:
+            idx = 0
+            while True:
+                try:
+                    subkey_name = winreg.EnumKey(parent, idx)
+                except OSError:
+                    break
+                idx += 1
+
+                if not subkey_name.isdigit():
+                    continue
+
+                sub_path = _DISPLAY_CLASS_PATH + "\\" + subkey_name
+                try:
+                    with winreg.OpenKey(
+                        winreg.HKEY_LOCAL_MACHINE, sub_path, 0, winreg.KEY_READ
+                    ) as k:
+                        try:
+                            mdid, _ = winreg.QueryValueEx(k, "MatchingDeviceId")
+                            if not (isinstance(mdid, str)
+                                    and _AMD_VENDOR_PREFIX in mdid.upper()):
+                                continue
+                        except OSError:
+                            continue
+
+                        # REG_QWORD (8-byte) — preferred
+                        try:
+                            val, vtype = winreg.QueryValueEx(
+                                k, "HardwareInformation.qwMemorySize")
+                            if vtype == winreg.REG_QWORD and isinstance(val, int) and val > 0:
+                                _elog(f"_detect_vram_size: registry qwMemorySize = "
+                                      f"0x{val:X} ({val // (1 << 20)} MB) "
+                                      f"[subkey {subkey_name}]")
+                                return val
+                        except OSError:
+                            pass
+
+                        # REG_DWORD fallback (older drivers store 32-bit MemorySize)
+                        try:
+                            val, vtype = winreg.QueryValueEx(
+                                k, "HardwareInformation.MemorySize")
+                            if vtype in (winreg.REG_DWORD,
+                                         winreg.REG_DWORD_LITTLE_ENDIAN) \
+                                    and isinstance(val, int) and val > 0:
+                                _elog(f"_detect_vram_size: registry MemorySize = "
+                                      f"0x{val:X} ({val // (1 << 20)} MB) "
+                                      f"[subkey {subkey_name}]")
+                                return val
+                        except OSError:
+                            pass
+                except OSError:
+                    continue
+
+    except OSError as e:
+        _elog(f"_detect_vram_size: registry enumeration failed: {e}")
+
+    _elog("_detect_vram_size: registry read failed, falling back to BAR probe")
+    if inpout is not None and vram_bar is not None:
+        return _detect_bar_size(inpout, vram_bar)
+    return 0
+
+
+def _scan_for_driver_buffer(smu, inpout, vram_bar, bar_limit):
+    """Scan the visible BAR for the driver's DMA buffer.
+
+    Sends TransferTableSmu2Dram (0x12) so the SMU writes metrics to the
+    address the Windows driver registered, then reads the BAR in chunks
+    looking for 4KB-aligned pages that match the SmuMetrics_t field layout.
+
+    Returns (offset, virt, handle, phys) on success,
+    or (None, None, None, None) when no valid buffer is found.
+    """
+    import struct as _st
+    import time
+
+    smu.send_msg(PPSMC.TransferTableSmu2Dram, TABLE_SMU_METRICS)
+    smu.hdp_flush()
+    time.sleep(0.15)
+    smu.send_msg(PPSMC.TransferTableSmu2Dram, TABLE_SMU_METRICS)
+    smu.hdp_flush()
+    time.sleep(0.15)
+
+    scan_size = min(bar_limit + 0x1000, 0x8000000)
+    PAGE = 0x1000
+    CHUNK = 0x400000
+
+    OFF_GFXCLK = 0
+    OFF_UCLK   = 8
+    OFF_MC     = SmuMetrics_t.MetricsCounter.offset
+    OFF_PWR    = SmuMetrics_t.AverageSocketPower.offset
+
+    candidates = []
+
+    for chunk_base in range(0, scan_size, CHUNK):
+        chunk_sz = min(CHUNK, scan_size - chunk_base)
+        try:
+            cv, ch = inpout.map_phys(vram_bar + chunk_base, chunk_sz)
+            snap = read_buf(cv, chunk_sz)
+            inpout.unmap_phys(cv, ch)
+        except Exception as e:
+            _elog(f"_scan: chunk 0x{chunk_base:X} failed: {e}")
+            continue
+
+        for pg in range(0, chunk_sz, PAGE):
+            page = snap[pg:pg + PAGE]
+            if len(page) < OFF_PWR + 2:
+                continue
+
+            mc  = _st.unpack_from('<I', page, OFF_MC)[0]
+            pwr = _st.unpack_from('<H', page, OFF_PWR)[0]
+            if mc == 0 or mc >= 0x80000000 or pwr == 0 or pwr > 600:
+                continue
+
+            gfx  = _st.unpack_from('<I', page, OFF_GFXCLK)[0]
+            uclk = _st.unpack_from('<I', page, OFF_UCLK)[0]
+            if gfx == 0 or gfx > 5000 or uclk > 5000:
+                continue
+
+            off = chunk_base + pg
+            candidates.append((off, gfx, uclk, mc, pwr))
+
+    _elog(f"_scan: {len(candidates)} candidate(s)")
+
+    if not candidates:
+        return (None, None, None, None)
+
+    time.sleep(0.5)
+    smu.send_msg(PPSMC.TransferTableSmu2Dram, TABLE_SMU_METRICS)
+    smu.hdp_flush()
+    time.sleep(0.15)
+
+    for off, gfx, uclk, mc_old, pwr in candidates:
+        try:
+            v, h = inpout.map_phys(vram_bar + off, 0x4000)
+            raw = read_buf(v, SMU_METRICS_SIZE)
+            m = parse_metrics(raw)
+            if m.MetricsCounter > mc_old and m.MetricsCounter < 0x80000000:
+                return (off, v, h, vram_bar + off)
+            inpout.unmap_phys(v, h)
+        except Exception:
+            continue
+
+    _elog("_scan: no candidate passed MetricsCounter validation")
+    return (None, None, None, None)
+
+
+def _scan_for_driver_buffer_fp(smu, inpout, vram_bar, bar_limit,
+                                pp_fingerprint, fp_offset_in_pp):
+    """Scan BAR for the PP table fingerprint to locate the DMA buffer.
+
+    Sends TransferTableSmu2Dram(TABLE_PPTABLE) so the SMU writes the full
+    PP table at offset 0 of the driver's DMA buffer, then scans the BAR
+    for the known-immutable fingerprint bytes.  Single-pass exact match --
+    no heuristics, no timing delays.
+
+    Returns (offset, virt, handle, phys) on success,
+    or (None, None, None, None) when no valid buffer is found.
+    """
+    import time
+
+    scan_size = 0x20000000  # 512 MB — fingerprint scan is read-only, safe beyond BAR probe limit
+    CHUNK = 0x400000
+    fp_len = len(pp_fingerprint)
+
+    _elog(f"_scan_fp: scanning {scan_size / (1 << 20):.0f} MB for "
+          f"{fp_len}-byte fingerprint (fp_offset_in_pp=0x{fp_offset_in_pp:X})")
+
+    for chunk_base in range(0, scan_size, CHUNK):
+        # Re-send PP table transfer before every chunk read to defeat
+        # the Windows driver racing us with metrics transfers.
+        smu.send_msg(PPSMC.TransferTableSmu2Dram, TABLE_PPTABLE)
+        smu.hdp_flush()
+
+        chunk_sz = min(CHUNK, scan_size - chunk_base)
+        try:
+            cv, ch = inpout.map_phys(vram_bar + chunk_base, chunk_sz)
+            snap = read_buf(cv, chunk_sz)
+            inpout.unmap_phys(cv, ch)
+        except Exception as e:
+            _elog(f"_scan_fp: chunk 0x{chunk_base:X} failed: {e}")
+            continue
+
+        search_start = 0
+        while True:
+            idx = snap.find(pp_fingerprint, search_start)
+            if idx < 0:
+                break
+            search_start = idx + 1
+
+            buf_offset = chunk_base + idx - fp_offset_in_pp
+            if buf_offset < 0:
+                _elog(f"_scan_fp: fingerprint at 0x{chunk_base + idx:X} gives "
+                      f"negative buf_offset 0x{buf_offset:X}, skipping")
+                continue
+
+            _elog(f"_scan_fp: fingerprint match at BAR+0x{chunk_base + idx:X}, "
+                  f"DMA base offset=0x{buf_offset:X}")
+
+            try:
+                v, h = inpout.map_phys(vram_bar + buf_offset, 0x4000)
+                valid = _validate_metrics_at(
+                    v, smu, PPSMC.TransferTableSmu2Dram)
+                if valid:
+                    _elog(f"_scan_fp: metrics validation OK at "
+                          f"offset 0x{buf_offset:X}")
+                    return (buf_offset, v, h, vram_bar + buf_offset)
+                _elog(f"_scan_fp: metrics validation FAILED at "
+                      f"offset 0x{buf_offset:X}")
+                inpout.unmap_phys(v, h)
+            except Exception as e:
+                _elog(f"_scan_fp: validation map failed at "
+                      f"offset 0x{buf_offset:X}: {e}")
+
+    _elog("_scan_fp: no fingerprint match found in BAR")
+    return (None, None, None, None)
+
+
+def vram_scan_for_dma(smu, inpout, vram_bar, vbios_values=None,
+                      progress_callback=None):
+    """Scan full GPU VRAM for the DMA buffer using a single PP table transfer.
+
+    Unlike ``_scan_for_driver_buffer_fp`` which re-sends TABLE_PPTABLE every
+    chunk (making a 16 GB scan infeasible), this function sends a single
+    TransferTableSmu2Dram(TABLE_PPTABLE) up front.  The inner fingerprint
+    (MsgLimits region at ~DMA+0xA48) lies beyond the zone that metrics
+    transfers overwrite, so it persists across subsequent driver activity.
+
+    Falls back to heuristic metrics scan (``_scan_for_driver_buffer``) when
+    no fingerprint match is found.
+
+    Args:
+        smu:               SmuCmd instance.
+        inpout:            InpOut32 driver instance.
+        vram_bar:          Physical base address of the GPU BAR.
+        vbios_values:      VbiosValues with pp_inner_fingerprint / pp_inner_fp_dma_offset.
+        progress_callback: fn(pct: float, msg: str) for progress updates.
+
+    Returns:
+        dict with ``offset``, ``method``, ``vram_size`` on success, or ``None``.
+    """
+    cb = progress_callback or _noop_cb
+
+    # --- Determine scan range -------------------------------------------------
+    vram_size = _detect_vram_size(inpout, vram_bar)
+    if vram_size <= 0:
+        vram_size = _detect_bar_size(inpout, vram_bar)
+    if vram_size <= 0:
+        cb(100, "VRAM scan failed: could not determine VRAM/BAR size")
+        _elog("vram_scan_for_dma: cannot determine scan range")
+        return None
+
+    vram_mb = vram_size / (1 << 20)
+    cb(2, f"VRAM size: {vram_mb:.0f} MB — scanning full range")
+    _elog(f"vram_scan_for_dma: vram_size=0x{vram_size:X} ({vram_mb:.0f} MB)")
+
+    # --- Resolve fingerprint --------------------------------------------------
+    inner_fp = (vbios_values.pp_inner_fingerprint
+                if vbios_values is not None else b'')
+    fp_dma_offset = (vbios_values.pp_inner_fp_dma_offset
+                     if vbios_values is not None else 0)
+
+    if not inner_fp:
+        cb(5, "No inner PP fingerprint — skipping fingerprint phase, "
+              "falling back to heuristic scan")
+        _elog("vram_scan_for_dma: no inner fingerprint, going straight "
+              "to heuristic fallback")
+    else:
+        cb(5, f"Fingerprint: {len(inner_fp)} bytes at DMA+0x{fp_dma_offset:X}")
+        _elog(f"vram_scan_for_dma: inner_fp={len(inner_fp)}B "
+              f"fp_dma_offset=0x{fp_dma_offset:X}")
+
+        # --- Single TABLE_PPTABLE transfer ------------------------------------
+        cb(6, "Sending single TransferTableSmu2Dram(TABLE_PPTABLE)...")
+        smu.send_msg(PPSMC.TransferTableSmu2Dram, TABLE_PPTABLE)
+        smu.hdp_flush()
+
+        # --- Chunked BAR scan -------------------------------------------------
+        CHUNK = 4 * 1024 * 1024  # 4 MB
+        scan_limit = min(vram_size, 0x400000000)  # cap at 16 GB
+        total_chunks = (scan_limit + CHUNK - 1) // CHUNK
+
+        _elog(f"vram_scan_for_dma: scanning {total_chunks} x 4 MB chunks "
+              f"({scan_limit / (1 << 20):.0f} MB)")
+
+        for ci in range(total_chunks):
+            chunk_base = ci * CHUNK
+            chunk_sz = min(CHUNK, scan_limit - chunk_base)
+
+            pct = 8 + (ci / total_chunks) * 82  # progress 8-90%
+            if ci % 64 == 0 or ci == total_chunks - 1:
+                scanned_mb = chunk_base / (1 << 20)
+                cb(pct, f"Scanning VRAM: {scanned_mb:.0f} / {scan_limit / (1 << 20):.0f} MB")
+
+            try:
+                cv, ch = inpout.map_phys(vram_bar + chunk_base, chunk_sz)
+                snap = read_buf(cv, chunk_sz)
+                inpout.unmap_phys(cv, ch)
+            except Exception as e:
+                _elog(f"vram_scan_for_dma: chunk 0x{chunk_base:X} map failed: {e}")
+                continue
+
+            search_start = 0
+            while True:
+                idx = snap.find(inner_fp, search_start)
+                if idx < 0:
+                    break
+                search_start = idx + 1
+
+                buf_offset = chunk_base + idx - fp_dma_offset
+                if buf_offset < 0:
+                    _elog(f"vram_scan_for_dma: fp at BAR+0x{chunk_base + idx:X} "
+                          f"gives negative offset, skipping")
+                    continue
+
+                _elog(f"vram_scan_for_dma: fp match at BAR+0x{chunk_base + idx:X}, "
+                      f"DMA base=0x{buf_offset:X}")
+                cb(pct, f"Fingerprint match at offset 0x{buf_offset:X} — validating...")
+
+                try:
+                    v, h = inpout.map_phys(vram_bar + buf_offset, 0x4000)
+                    valid = _validate_metrics_at(
+                        v, smu, PPSMC.TransferTableSmu2Dram)
+                    inpout.unmap_phys(v, h)
+
+                    if valid:
+                        _elog(f"vram_scan_for_dma: VALIDATED at offset "
+                              f"0x{buf_offset:X}")
+                        _save_dma_cache(buf_offset, "vram-fp-scan")
+                        cb(100, f"DMA buffer found at offset 0x{buf_offset:X} "
+                                f"(VRAM fingerprint scan)")
+                        return {
+                            "offset": buf_offset,
+                            "method": "vram-fp-scan",
+                            "vram_size": vram_size,
+                        }
+                    _elog(f"vram_scan_for_dma: validation FAILED at "
+                          f"offset 0x{buf_offset:X}")
+                except Exception as e:
+                    _elog(f"vram_scan_for_dma: validation map error at "
+                          f"0x{buf_offset:X}: {e}")
+
+        cb(90, "Fingerprint scan complete — no valid match found")
+        _elog("vram_scan_for_dma: fingerprint phase found nothing")
+
+    # --- Fallback: heuristic metrics scan -------------------------------------
+    cb(91, "Falling back to heuristic metrics scan...")
+    _elog("vram_scan_for_dma: heuristic fallback via _scan_for_driver_buffer")
+    bar_limit = _detect_bar_size(inpout, vram_bar)
+    found = _scan_for_driver_buffer(smu, inpout, vram_bar, bar_limit)
+    if found[0] is not None:
+        drv_off, v, h, phys = found
+        inpout.unmap_phys(v, h)
+        _save_dma_cache(drv_off, "vram-heuristic-scan")
+        cb(100, f"DMA buffer found at offset 0x{drv_off:X} (heuristic scan)")
+        _elog(f"vram_scan_for_dma: heuristic SUCCESS at 0x{drv_off:X}")
+        return {
+            "offset": drv_off,
+            "method": "vram-heuristic-scan",
+            "vram_size": vram_size,
+        }
+
+    cb(100, "VRAM scan failed: no DMA buffer found")
+    _elog("vram_scan_for_dma: all methods exhausted — returning None")
+    return None
+
+
+def _discover_dma_buffer(smu, inpout, vram_bar, vbios_values=None,
+                         gui_log=None):
+    """Discover the Windows driver's existing DMA buffer.
+
+    The SMU firmware locks the Driver DRAM address to whatever the Windows
+    driver registered at boot (SetDriverDramAddr is a one-shot command).
+    We cannot redirect DMA to our own buffer.  Instead we locate the
+    driver's buffer by:
+
+      0. Try the cached offset from a previous successful discovery.
+      1. Try the default offset (0xFBCC000) — works on most systems.
+      2. If VBIOS fingerprint available: scan BAR for the PP table
+         fingerprint (exact byte match, no heuristics).
+      3. Scan the BAR for a live metrics page (MetricsCounter incrementing).
+      4. Fall back to the default offset without validation.
+
+    On success the validated offset is persisted to .dma_offset_cache.json
+    so subsequent launches can skip the scan.
+
+    Args:
+        vbios_values: Optional VbiosValues with pp_fingerprint for
+                      deterministic DMA buffer discovery.
+        gui_log:      Optional callable(str) for user-visible log messages.
+
+    Returns (virt, handle, phys, dma_path_name) or raises on total failure.
+    """
+    def _glog(msg):
+        _elog(msg)
+        if gui_log:
+            try:
+                gui_log(msg)
+            except Exception:
+                pass
+
+    bar_limit = _detect_bar_size(inpout, vram_bar)
+
+    # --- Attempt 0: Cached offset from previous run ----------------------
+    cached_offset = _load_dma_cache()
+    if cached_offset is not None:
+        _elog(f"_discover_dma: Attempt 0 (cached): offset=0x{cached_offset:X}")
+        drv_phys = vram_bar + cached_offset
+        try:
+            virt, handle = inpout.map_phys(drv_phys, 0x4000)
+            valid = _validate_metrics_at(virt, smu, PPSMC.TransferTableSmu2Dram)
+            _elog(f"_discover_dma: cached validation -> "
+                  f"{'OK' if valid else 'FAILED'}")
+            if valid:
+                _glog(f"DMA buffer: cached offset 0x{cached_offset:X} validated OK")
+                return virt, handle, drv_phys, f"cached-0x{cached_offset:X}"
+            inpout.unmap_phys(virt, handle)
+            _glog(f"DMA buffer: cached offset 0x{cached_offset:X} is stale, "
+                  f"rescanning...")
+        except Exception as e:
+            _elog(f"_discover_dma: cached map failed: {e}")
+            _glog(f"DMA buffer: cached offset 0x{cached_offset:X} is stale, "
+                  f"rescanning...")
+    else:
+        _glog("DMA buffer: no cached offset, discovering...")
+
+    # --- Attempt 1: Validate the default driver buffer offset ------------
+    _elog(f"_discover_dma: Attempt 1 (driver-default): "
+          f"offset=0x{DRIVER_BUF_OFFSET_DEFAULT:X}")
+    drv_phys = vram_bar + DRIVER_BUF_OFFSET_DEFAULT
+    try:
+        virt, handle = inpout.map_phys(drv_phys, 0x4000)
+        valid = _validate_metrics_at(virt, smu, PPSMC.TransferTableSmu2Dram)
+        _elog(f"_discover_dma: driver-default validation -> "
+              f"{'OK' if valid else 'FAILED'}")
+        if valid:
+            _save_dma_cache(DRIVER_BUF_OFFSET_DEFAULT, "driver-default")
+            _glog(f"DMA buffer found at offset 0x{DRIVER_BUF_OFFSET_DEFAULT:X} "
+                  f"(driver-default) — cached for next startup")
+            return virt, handle, drv_phys, "driver-default"
+        inpout.unmap_phys(virt, handle)
+    except Exception as e:
+        _elog(f"_discover_dma: driver-default map failed: {e}")
+
+    # --- Attempt 2: Fingerprint-based BAR scan ---------------------------
+    inner_fp = (vbios_values.pp_inner_fingerprint
+                if vbios_values is not None else b'')
+    if inner_fp:
+        fp_offset_in_pp = vbios_values.pp_inner_fp_dma_offset
+        _elog(f"_discover_dma: Attempt 2 (fingerprint-scan): "
+              f"{len(inner_fp)}-byte inner fingerprint, "
+              f"dma_offset=0x{fp_offset_in_pp:X}")
+        _glog("DMA buffer: fingerprint scan in progress...")
+        found = _scan_for_driver_buffer_fp(
+            smu, inpout, vram_bar, bar_limit,
+            inner_fp, fp_offset_in_pp)
+        if found[0] is not None:
+            drv_off, virt, handle, phys = found
+            _elog(f"_discover_dma: SUCCESS via fingerprint-scan "
+                  f"at offset 0x{drv_off:X}")
+            _save_dma_cache(drv_off, "fp-scan")
+            _glog(f"DMA buffer found at offset 0x{drv_off:X} "
+                  f"(fingerprint-scan) — cached for next startup")
+            return virt, handle, phys, f"fp-scan-0x{drv_off:X}"
+    else:
+        _elog("_discover_dma: Attempt 2 (fingerprint-scan): "
+              "skipped — no inner PPTable_t fingerprint available")
+
+    # --- Attempt 3: Heuristic metrics scan --------------------------------
+    _elog("_discover_dma: Attempt 3 (driver-scan): "
+          "scanning BAR for existing driver buffer")
+    _glog("DMA buffer: heuristic metrics scan in progress...")
+    found = _scan_for_driver_buffer(smu, inpout, vram_bar, bar_limit)
+    if found[0] is not None:
+        drv_off, virt, handle, phys = found
+        _elog(f"_discover_dma: SUCCESS via driver-scan at offset 0x{drv_off:X}")
+        _save_dma_cache(drv_off, "driver-scan")
+        _glog(f"DMA buffer found at offset 0x{drv_off:X} "
+              f"(heuristic-scan) — cached for next startup")
+        return virt, handle, phys, f"driver-scan-0x{drv_off:X}"
+
+    # --- Attempt 4: Use default offset without validation ----------------
+    _elog("_discover_dma: Attempt 4 (driver-unvalidated): "
+          "using default offset without validation")
+    drv_phys = vram_bar + DRIVER_BUF_OFFSET_DEFAULT
+    virt, handle = inpout.map_phys(drv_phys, 0x4000)
+    _glog(f"DMA buffer: using unvalidated default offset "
+          f"0x{DRIVER_BUF_OFFSET_DEFAULT:X}")
+    return virt, handle, drv_phys, "driver-unvalidated"
+
+
+def _load_vbios_values():
+    """Try to load VbiosValues from the on-disk VBIOS ROM.
+
+    Returns VbiosValues or None if the file is missing or unparseable.
+    """
+    try:
+        from src.io.vbios_storage import read_vbios_decoded
+        from src.io.vbios_parser import parse_vbios_from_bytes
+    except ImportError:
+        _elog("_load_vbios_values: import failed — VBIOS modules unavailable")
+        return None
+
+    vbios_path = os.path.join(_project_root, "bios", "vbios.rom")
+    if not os.path.isfile(vbios_path):
+        _elog(f"_load_vbios_values: {vbios_path} not found")
+        return None
+
+    rom_bytes, _ = read_vbios_decoded(vbios_path)
+    if rom_bytes is None:
+        _elog("_load_vbios_values: read_vbios_decoded returned None")
+        return None
+
+    vals = parse_vbios_from_bytes(rom_bytes, rom_path=vbios_path)
+    if vals is not None:
+        _elog(f"_load_vbios_values: OK — outer fp "
+              f"{len(vals.pp_fingerprint)}B, inner fp "
+              f"{len(vals.pp_inner_fingerprint)}B, "
+              f"baseclock_pp_offset=0x{vals.baseclock_pp_offset:X}")
+    else:
+        _elog("_load_vbios_values: parse_vbios_from_bytes returned None")
+    return vals
+
+
+def init_hardware(gui_log=None):
     """Initialize hardware drivers and map the driver DMA buffer.
 
+    Locates the Windows driver's existing DMA buffer in VRAM (the SMU
+    firmware locks the DMA address at boot and ignores later overrides).
+    Falls back to a default offset if validation fails.
+
+    Args:
+        gui_log: Optional callable(str) for user-visible log messages
+                 (DMA discovery status).
+
     Returns a dict with keys:
-        wr0, inpout, mmio, smu, vram_bar, virt, handle, phys
+        wr0, inpout, mmio, smu, vram_bar, virt, handle, phys, dma_path
     Caller must call cleanup_hardware() when done.
     """
     _elog("init_hardware: starting")
     wr0, inpout, mmio, smu, vram_bar = create_smu(verbose=False)
-    phys = vram_bar + DRIVER_BUF_OFFSET
-    virt, handle = inpout.map_phys(phys, 0x3000)
-    _elog(f"init_hardware: OK, vram_bar=0x{vram_bar:X}, phys=0x{phys:X}")
+
+    vbios_values = _load_vbios_values()
+    virt, handle, phys, dma_path = _discover_dma_buffer(
+        smu, inpout, vram_bar, vbios_values=vbios_values,
+        gui_log=gui_log)
+    _elog(f"init_hardware: OK — dma_path={dma_path}")
+
     return {
         'wr0': wr0, 'inpout': inpout, 'mmio': mmio, 'smu': smu,
         'vram_bar': vram_bar, 'virt': virt, 'handle': handle, 'phys': phys,
+        'dma_path': dma_path,
     }
 
 
@@ -814,6 +1530,21 @@ def cleanup_hardware(hw):
             hw['wr0'].close()
     except Exception:
         pass
+
+
+def detect_bar_size(inpout, vram_bar):
+    """Public wrapper: probe BAR aperture via write-read at power-of-2 offsets."""
+    return _detect_bar_size(inpout, vram_bar)
+
+
+def detect_vram_size(inpout=None, vram_bar=None):
+    """Public wrapper: read GPU VRAM size from registry, fallback to BAR probe."""
+    return _detect_vram_size(inpout, vram_bar)
+
+
+def read_vram_start(mmio):
+    """Public wrapper: read gmc.vram_start from MMHUB FB_LOCATION_BASE register."""
+    return _read_vram_start(mmio)
 
 
 def get_gpu_state(smu, virt):
@@ -1567,7 +2298,8 @@ def apply_od_table_only(smu, virt, settings, only_offset=False):
             if settings.fclk_max > 0:
                 od.FclkFmax = settings.fclk_max
         write_buf(virt, bytes(od))
-        resp, _ = smu.send_msg(0x13, TABLE_OVERDRIVE)
+        smu.hdp_flush()
+        resp, _ = smu.send_msg(smu.transfer_write, TABLE_OVERDRIVE)
         results['od_commit'] = resp
     min_clock = settings.effective_min_clock
     effective_max = settings.effective_max
@@ -1610,7 +2342,8 @@ def apply_od_single_field(smu, virt, modify_fn):
         return False, "Could not read OD table from SMU"
     modify_fn(od)
     write_buf(virt, bytes(od))
-    resp, param = smu.send_msg(0x13, TABLE_OVERDRIVE)
+    smu.hdp_flush()
+    resp, param = smu.send_msg(smu.transfer_write, TABLE_OVERDRIVE)
     if resp != 1:
         return False, decode_od_fail(param)
     # Workload cycle to trigger DPM refresh — SMU picks up OD table changes
@@ -1740,7 +2473,8 @@ def apply_od_settings(smu, virt, settings):
             if settings.fclk_max > 0:
                 od.FclkFmax = settings.fclk_max
         write_buf(virt, bytes(od))
-        resp, _ = smu.send_msg(0x13, TABLE_OVERDRIVE)
+        smu.hdp_flush()
+        resp, _ = smu.send_msg(smu.transfer_write, TABLE_OVERDRIVE)
         results['od_commit'] = resp
 
     # Frequency limits

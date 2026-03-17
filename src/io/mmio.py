@@ -793,6 +793,43 @@ class GpuMMIO:
             "Need InpOut32 (preferred) or I/O BAR + I/O Space enabled."
         )
 
+    # ---- HDP cache flush (GPU<->CPU coherency) ----
+
+    # NBIF 6.3.1 (RDNA4 consumer): BIF_BX_PF0_HDP_MEM_COHERENCY_FLUSH_CNTL
+    # remapped to MMIO_REG_HOLE_OFFSET = 0x80000 - PAGE_SIZE = 0x7F000.
+    # Writing 0 performs combined flush+invalidate (no separate invalidate needed).
+    _HDP_FLUSH_OFFSETS = [
+        0x7F000,  # NBIF 6.3.1 (RDNA4 consumer)
+        0x1A000,  # NBIO 7.9 (data center / fallback)
+    ]
+
+    def hdp_flush(self):
+        """Flush+invalidate the GPU HDP cache for CPU<->VRAM coherency.
+
+        Must be called:
+        - After SMU-to-DRAM transfers (read path) so CPU sees fresh data
+        - Before DRAM-to-SMU transfers (write path) so GPU sees CPU writes
+
+        Writes 0 to the HDP_MEM_COHERENCY_FLUSH_CNTL remap register, then
+        reads back a dummy MMIO register as a fence/barrier.
+        """
+        if not hasattr(self, '_hdp_flush_offset'):
+            self._hdp_flush_offset = self._HDP_FLUSH_OFFSETS[0]
+            self._hdp_flush_count = 0
+
+        try:
+            self.write32(self._hdp_flush_offset, 0)
+            self.read32(0x00)  # fence: wait for the flush to complete
+        except Exception as e:
+            if not hasattr(self, '_hdp_flush_err_logged'):
+                self._hdp_flush_err_logged = True
+                print(f"[HDP] flush FAILED at BAR+0x{self._hdp_flush_offset:X}: {e}")
+            return
+
+        self._hdp_flush_count += 1
+        if self._hdp_flush_count == 1:
+            print(f"[HDP] Cache flush+invalidate via BAR+0x{self._hdp_flush_offset:X}")
+
     # ---- SMN bus access ----
 
     def smn_read32(self, smn_addr):

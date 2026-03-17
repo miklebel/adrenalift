@@ -100,12 +100,19 @@ class VbiosValues:
     rom_offset: int = 0
     rom_path:   str = ""
 
-    # Immutable PP table header fingerprint for memory scanning.
-    # Extracted from golden_pp_id through thermal_controller_type — these
-    # never change regardless of driver clock/power patching.
+    # Immutable PP table header fingerprint for system-RAM scanning.
+    # Extracted from golden_pp_id through thermal_controller_type in the
+    # outer smu_14_0_2_powerplay_table wrapper — never changes.
     pp_fingerprint: bytes = b''
     fingerprint_to_clocks: int = 0   # byte offset from fingerprint match -> BaseClockAc
     baseclock_pp_offset: int = 0     # absolute byte offset of BaseClockAc within PP table
+
+    # Inner PPTable_t fingerprint for DMA buffer (VRAM) scanning.
+    # The DMA buffer contains only the inner PPTable_t (smc_pptable),
+    # NOT the outer wrapper.  Extracted from DriverReportedClocks deep
+    # within SkuTable — safely past the metrics overwrite zone.
+    pp_inner_fingerprint: bytes = b''
+    pp_inner_fp_dma_offset: int = 0   # offset of inner fingerprint within DMA buffer
 
     def clock_pattern(self) -> bytes:
         return struct.pack("<3H", self.baseclock_ac, self.gameclock_ac, self.boostclock_ac)
@@ -235,9 +242,10 @@ def _parse_vbios_upp_bytes(
         if power_ac is None or tdc_gfx is None:
             return None
 
-        # -- Extract immutable fingerprint for memory scanning --
-        # Use bytes from golden_pp_id through thermal_controller_type.
-        # These are hardware identifiers that never change during patching.
+        # -- Extract immutable fingerprints for memory scanning --
+
+        # Outer wrapper fingerprint (for system-RAM scanning):
+        # golden_pp_id through thermal_controller_type.
         pp_fp = b''
         fp_to_clk = 0
         bc_pp_off = 0
@@ -255,13 +263,39 @@ def _parse_vbios_upp_bytes(
         except Exception:
             pass
 
+        # Inner PPTable_t fingerprint (for DMA buffer / VRAM scanning):
+        # The DMA buffer only contains the inner smc_pptable (PPTable_t),
+        # not the outer smu_14_0_2_powerplay_table wrapper.
+        # We use MsgLimits/Power (board-level power limits) because:
+        #   - Deep enough in SkuTable to survive metrics overwrite (~0x1500B)
+        #   - NOT modified by SMU fusing (unlike DriverReportedClocks)
+        #   - Card-specific and non-zero → low false-positive risk
+        _INNER_FP_LEN = 16
+        pp_inner_fp = b''
+        inner_fp_dma_off = 0
+        try:
+            pfe_ver = _get_info("smc_pptable/PFE_Settings/Version")
+            pwr_info = _get_info("smc_pptable/SkuTable/MsgLimits/Power/0/0")
+            if pfe_ver and pwr_info:
+                smc_off = pfe_ver["offset"]
+                pwr_off = pwr_info["offset"]
+                inner_fp_dma_off = pwr_off - smc_off
+                if pwr_off + _INNER_FP_LEN <= len(pp_tbl):
+                    pp_inner_fp = bytes(pp_tbl[pwr_off:pwr_off + _INNER_FP_LEN])
+        except Exception:
+            pass
+
         if diagnostic_out is not None:
             diagnostic_out.append(f"  Parsed via upp (PP table at 0x{pp_offset:04X}, {pp_len} bytes)")
             diagnostic_out.append(f"  => {base}/{game}/{boost} MHz  PPT={power_ac}W  TDC={tdc_gfx}A")
             if pp_fp:
                 diagnostic_out.append(
-                    f"  Fingerprint: {len(pp_fp)} bytes at PP+0x{gp_info['offset']:X}, "
+                    f"  Fingerprint (outer): {len(pp_fp)} bytes at PP+0x{gp_info['offset']:X}, "
                     f"clocks at +{fp_to_clk}")
+            if pp_inner_fp:
+                diagnostic_out.append(
+                    f"  Fingerprint (inner): {len(pp_inner_fp)} bytes at "
+                    f"PP+0x{pwr_off:X}, DMA+0x{inner_fp_dma_off:X}")
 
         return VbiosValues(
             baseclock_ac=base or 0,
@@ -285,6 +319,8 @@ def _parse_vbios_upp_bytes(
             pp_fingerprint=pp_fp,
             fingerprint_to_clocks=fp_to_clk,
             baseclock_pp_offset=bc_pp_off,
+            pp_inner_fingerprint=pp_inner_fp,
+            pp_inner_fp_dma_offset=inner_fp_dma_off,
         )
     except Exception:
         return None

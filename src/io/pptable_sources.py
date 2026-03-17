@@ -331,9 +331,8 @@ def read_smu_pptable_blob(
         table_id: Table ID to read. If None, tries to import TABLE_PPTABLE
                   from od_table, falling back to 0.
         read_size: How many bytes to read back from the DMA buffer.
-        use_tools: If True and smu.transfer_table_from_smu exists, uses the
-                   "WithAddr" path (tools DRAM addr). If False, uses driver
-                   DRAM addr path.
+        use_tools: Deprecated; ignored.  transfer_table_from_smu now always
+                   uses the driver DRAM path (0x12) via smu.transfer_read.
 
     Returns:
         Raw bytes of length read_size, or None on failure.

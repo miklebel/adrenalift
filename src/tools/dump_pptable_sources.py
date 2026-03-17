@@ -236,7 +236,7 @@ def _dump_smu(
 ) -> None:
     # Import lazily to keep this script usable without driver access.
     try:
-        from overclock import create_smu, DRIVER_BUF_OFFSET  # type: ignore
+        from overclock import create_smu, DRIVER_BUF_OFFSET_DEFAULT as DRIVER_BUF_OFFSET  # type: ignore
     except Exception as e:
         print()
         print("=" * 80)
