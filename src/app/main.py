@@ -33,6 +33,13 @@ from src.app.help_texts import (
     REG_CHEATSHEET_HTML,
     DIAG_VRAM_DUMP_HTML,
 )
+from src.app.ui_helpers import (
+    make_spinbox,
+    make_cheatsheet_button,
+    make_set_button,
+    make_current_value_label,
+    add_param_row,
+)
 
 from PySide6.QtCore import Qt, QSize, QThread, QTimer, Signal, QtMsgType, qInstallMessageHandler
 from PySide6.QtWidgets import (
@@ -1054,36 +1061,21 @@ class MainOverclockWidget(QWidget):
     def _setup_simple_tab(self):
         outer = QVBoxLayout(self.simple_tab)
 
-        hint_row = QHBoxLayout()
-        hint_btn = QToolButton()
-        hint_btn.setIcon(self.style().standardIcon(
-            QStyle.StandardPixmap.SP_MessageBoxQuestion))
-        hint_btn.setIconSize(QSize(18, 18))
-        hint_btn.setToolTip("How PP Table RAM patching works")
-        hint_btn.setStyleSheet(
-            "QToolButton { border: none; background: transparent; }")
-        hint_btn.setCursor(Qt.CursorShape.WhatsThisCursor)
-        hint_btn.clicked.connect(
-            lambda: self._show_smu_cheatsheet(
-                "How It Works", SIMPLE_HOW_IT_WORKS_HTML))
-        hint_row.addWidget(hint_btn)
-        hint_row.addWidget(QLabel("<b>How it works</b>"))
-        hint_row.addStretch()
+        _, hint_row = make_cheatsheet_button(
+            self, "How It Works", SIMPLE_HOW_IT_WORKS_HTML,
+            self._show_smu_cheatsheet,
+            tooltip="How PP Table RAM patching works",
+            label="How it works",
+        )
         outer.addLayout(hint_row)
 
         form = QFormLayout()
 
-        self.clock_spin = QSpinBox()
-        self.clock_spin.setRange(500, 5000)
-        self.clock_spin.setValue(3500)
-        self.clock_spin.setSuffix(" MHz")
+        self.clock_spin = make_spinbox(500, 5000, 3500, " MHz")
         self.clock_spin.valueChanged.connect(self._update_effective_max)
         form.addRow("Clock:", self.clock_spin)
 
-        self.offset_spin = QSpinBox()
-        self.offset_spin.setRange(0, 2000)
-        self.offset_spin.setValue(800)
-        self.offset_spin.setSuffix(" MHz")
+        self.offset_spin = make_spinbox(0, 2000, 800, " MHz")
         self.offset_spin.valueChanged.connect(self._update_effective_max)
         form.addRow("Offset:", self.offset_spin)
 
@@ -1411,42 +1403,24 @@ class MainOverclockWidget(QWidget):
         self._detailed_tables = {}
 
         def _add_pp_row(table, human, key, unit, vb_val, ram_key, smu_key, widget):
-            row = table.rowCount()
-            table.insertRow(row)
-            table.setItem(row, 0, QTableWidgetItem(human))
-            table.setItem(row, 1, QTableWidgetItem(key))
-            table.setItem(row, 2, QTableWidgetItem(unit))
-            cv_label = QLabel("—")
-            table.setCellWidget(row, 3, cv_label)
-            table.setCellWidget(row, 4, widget)
+            info = add_param_row(table, human, key, unit, widget)
             self._param_ram_key[key] = ram_key
             self._param_smu_key[key] = smu_key
-            self._param_current_value_widget[key] = cv_label
-            self._param_unit[key] = f" {unit}" if unit else ""
+            self._param_current_value_widget[key] = info["cv_label"]
+            self._param_unit[key] = info["unit_str"]
             self._detailed_param_widgets[key] = widget
 
         def _add_smu_row(table, human, key, unit, vb_val, widget, smu_key=None, row_apply_fn=None):
-            row = table.rowCount()
-            table.insertRow(row)
-            table.setItem(row, 0, QTableWidgetItem(human))
-            table.setItem(row, 1, QTableWidgetItem(key))
-            table.setItem(row, 2, QTableWidgetItem(unit))
-            cv_label = QLabel("—")
-            table.setCellWidget(row, 3, cv_label)
-            table.setCellWidget(row, 4, widget)
-            self._param_current_value_widget[key] = cv_label
-            self._param_unit[key] = f" {unit}" if unit else ""
+            info = add_param_row(
+                table, human, key, unit, widget,
+                apply_fn=row_apply_fn, apply_label=human,
+                run_with_hardware=self._run_with_hardware,
+            )
+            self._param_current_value_widget[key] = info["cv_label"]
+            self._param_unit[key] = info["unit_str"]
             self._detailed_param_widgets[key] = widget
             if smu_key:
                 self._param_smu_key[key] = smu_key
-            if row_apply_fn is not None:
-                btn = QPushButton("Set")
-                btn.setMaximumWidth(50)
-                _label = human
-                _fn = row_apply_fn
-                btn.clicked.connect(lambda checked=False, fn=_fn, lbl=_label:
-                                    self._run_with_hardware(f"Set {lbl}", fn, require_scan=False))
-                table.setCellWidget(row, 5, btn)
 
         # (1) PP Section: expanded decoded PP fields
         pp_grp = QGroupBox("PP — Clocks & MsgLimits")
@@ -1487,17 +1461,13 @@ class MainOverclockWidget(QWidget):
             return None
 
         def _build_spinbox(default_value: int, unit: str, field_type: str):
-            w = QSpinBox()
             if field_type in ("I", "L", "i", "l"):
-                w.setRange(0, 2_000_000_000)
+                max_val = 2_000_000_000
             elif field_type in ("B", "b"):
-                w.setRange(0, 255)
+                max_val = 255
             else:
-                w.setRange(0, 65535)
-            w.setValue(int(default_value))
-            if unit:
-                w.setSuffix(f" {unit}")
-            return w
+                max_val = 65535
+            return make_spinbox(0, max_val, int(default_value), f" {unit}" if unit else "")
 
         # UPP offsets are absolute from PP table start, but valid_addrs
         # from the scan point to BaseClockAc.  Adjust by subtracting the
@@ -1655,70 +1625,37 @@ class MainOverclockWidget(QWidget):
 
         # Fallback to legacy subset when full decode isn't available.
         if pp_table.rowCount() == 0:
-            det_game_clock = QSpinBox()
-            det_game_clock.setRange(500, 5000)
-            det_game_clock.setValue(vb.gameclock_ac)
-            det_game_clock.setSuffix(" MHz")
+            det_game_clock = make_spinbox(500, 5000, vb.gameclock_ac, " MHz")
             _add_pp_row(pp_table, "Game Clock", "GameClockAc", "MHz", vb.gameclock_ac, "gameclock_ac", "gfxclk", det_game_clock)
 
-            det_boost_clock = QSpinBox()
-            det_boost_clock.setRange(500, 5000)
-            det_boost_clock.setValue(vb.boostclock_ac)
-            det_boost_clock.setSuffix(" MHz")
+            det_boost_clock = make_spinbox(500, 5000, vb.boostclock_ac, " MHz")
             _add_pp_row(pp_table, "Boost Clock", "BoostClockAc", "MHz", vb.boostclock_ac, "boostclock_ac", None, det_boost_clock)
 
-            det_power_ac = QSpinBox()
-            det_power_ac.setRange(50, 600)
-            det_power_ac.setValue(vb.power_ac)
-            det_power_ac.setSuffix(" W")
+            det_power_ac = make_spinbox(50, 600, vb.power_ac, " W")
             _add_pp_row(pp_table, "PPT AC", "PPT0_AC", "W", vb.power_ac, "ppt0_ac", "ppt", det_power_ac)
 
-            det_power_dc = QSpinBox()
-            det_power_dc.setRange(50, 600)
-            det_power_dc.setValue(vb.power_dc)
-            det_power_dc.setSuffix(" W")
+            det_power_dc = make_spinbox(50, 600, vb.power_dc, " W")
             _add_pp_row(pp_table, "PPT DC", "PPT0_DC", "W", vb.power_dc, "ppt0_dc", None, det_power_dc)
 
-            det_tdc_gfx = QSpinBox()
-            det_tdc_gfx.setRange(20, 500)
-            det_tdc_gfx.setValue(vb.tdc_gfx)
-            det_tdc_gfx.setSuffix(" A")
+            det_tdc_gfx = make_spinbox(20, 500, vb.tdc_gfx, " A")
             _add_pp_row(pp_table, "TDC GFX", "TDC_GFX", "A", vb.tdc_gfx, "tdc_gfx", None, det_tdc_gfx)
 
-            det_tdc_soc = QSpinBox()
-            det_tdc_soc.setRange(0, 200)
-            det_tdc_soc.setValue(vb.tdc_soc)
-            det_tdc_soc.setSuffix(" A")
+            det_tdc_soc = make_spinbox(0, 200, vb.tdc_soc, " A")
             _add_pp_row(pp_table, "TDC SOC", "TDC_SOC", "A", vb.tdc_soc, "tdc_soc", None, det_tdc_soc)
 
-            det_temp_edge = QSpinBox()
-            det_temp_edge.setRange(0, 150)
-            det_temp_edge.setValue(vb.temp_edge if vb.temp_edge else 100)
-            det_temp_edge.setSuffix(" °C")
+            det_temp_edge = make_spinbox(0, 150, vb.temp_edge if vb.temp_edge else 100, " °C")
             _add_pp_row(pp_table, "Temp Edge", "Temp_Edge", "°C", vb.temp_edge or "—", "temp_edge", "temp", det_temp_edge)
 
-            det_temp_hotspot = QSpinBox()
-            det_temp_hotspot.setRange(0, 150)
-            det_temp_hotspot.setValue(vb.temp_hotspot if vb.temp_hotspot else 110)
-            det_temp_hotspot.setSuffix(" °C")
+            det_temp_hotspot = make_spinbox(0, 150, vb.temp_hotspot if vb.temp_hotspot else 110, " °C")
             _add_pp_row(pp_table, "Temp Hotspot", "Temp_Hotspot", "°C", vb.temp_hotspot or "—", "temp_hotspot", None, det_temp_hotspot)
 
-            det_temp_mem = QSpinBox()
-            det_temp_mem.setRange(0, 150)
-            det_temp_mem.setValue(vb.temp_mem if vb.temp_mem else 100)
-            det_temp_mem.setSuffix(" °C")
+            det_temp_mem = make_spinbox(0, 150, vb.temp_mem if vb.temp_mem else 100, " °C")
             _add_pp_row(pp_table, "Temp Mem", "Temp_Mem", "°C", vb.temp_mem or "—", "temp_mem", None, det_temp_mem)
 
-            det_temp_vr_gfx = QSpinBox()
-            det_temp_vr_gfx.setRange(0, 200)
-            det_temp_vr_gfx.setValue(vb.temp_vr_gfx if vb.temp_vr_gfx else 115)
-            det_temp_vr_gfx.setSuffix(" °C")
+            det_temp_vr_gfx = make_spinbox(0, 200, vb.temp_vr_gfx if vb.temp_vr_gfx else 115, " °C")
             _add_pp_row(pp_table, "Temp VR GFX", "Temp_VR_GFX", "°C", vb.temp_vr_gfx or "—", "temp_vr_gfx", None, det_temp_vr_gfx)
 
-            det_temp_vr_soc = QSpinBox()
-            det_temp_vr_soc.setRange(0, 200)
-            det_temp_vr_soc.setValue(vb.temp_vr_soc if vb.temp_vr_soc else 115)
-            det_temp_vr_soc.setSuffix(" °C")
+            det_temp_vr_soc = make_spinbox(0, 200, vb.temp_vr_soc if vb.temp_vr_soc else 115, " °C")
             _add_pp_row(pp_table, "Temp VR SOC", "Temp_VR_SOC", "°C", vb.temp_vr_soc or "—", "temp_vr_soc", None, det_temp_vr_soc)
 
         pp_layout = QVBoxLayout(pp_grp)
@@ -1740,20 +1677,11 @@ class MainOverclockWidget(QWidget):
         pp_scroll.setWidgetResizable(True)
         pp_scroll.setWidget(pp_grp)
         pp_tab_layout = QVBoxLayout(self.pp_tab)
-        pp_hint_btn = QToolButton()
-        pp_hint_btn.setIcon(self.style().standardIcon(
-            QStyle.StandardPixmap.SP_MessageBoxQuestion))
-        pp_hint_btn.setIconSize(QSize(18, 18))
-        pp_hint_btn.setToolTip("How PP Table RAM patching works")
-        pp_hint_btn.setStyleSheet(
-            "QToolButton { border: none; background: transparent; }")
-        pp_hint_btn.setCursor(Qt.CursorShape.WhatsThisCursor)
-        pp_hint_btn.clicked.connect(
-            lambda: self._show_smu_cheatsheet("PP", PP_HELP_HTML))
-        pp_hint_row = QHBoxLayout()
-        pp_hint_row.addWidget(pp_hint_btn)
-        pp_hint_row.addWidget(QLabel("<b>PP — PowerPlay Table</b>"))
-        pp_hint_row.addStretch()
+        _, pp_hint_row = make_cheatsheet_button(
+            self, "PP", PP_HELP_HTML, self._show_smu_cheatsheet,
+            tooltip="How PP Table RAM patching works",
+            label="PP \u2014 PowerPlay Table",
+        )
         pp_tab_layout.addLayout(pp_hint_row)
         pp_tab_layout.addWidget(pp_scroll)
 
@@ -1786,35 +1714,25 @@ class MainOverclockWidget(QWidget):
 
         def _add_od_row(table, human, key, unit, vb_val, smu_key, widget, row_apply_fn=None,
                        feature_bit=None, limits_key=None):
-            row = table.rowCount()
-            table.insertRow(row)
-            table.setItem(row, 0, QTableWidgetItem(human))
-            table.setItem(row, 1, QTableWidgetItem(key))
-            table.setItem(row, 2, QTableWidgetItem(unit))
-            allowed_str = "—"
+            allowed_str = "\u2014"
             if od_limits is not None and feature_bit is not None:
                 allowed_str = "Yes" if od_limits.is_allowed(feature_bit) else "No"
-            table.setItem(row, 3, QTableWidgetItem(allowed_str))
-            cv_label = QLabel("—")
-            table.setCellWidget(row, 4, cv_label)
-            table.setCellWidget(row, 5, widget)
+            info = add_param_row(
+                table, human, key, unit, widget,
+                cv_col=4, widget_col=5, set_col=6,
+                extra_items=[(3, QTableWidgetItem(allowed_str))],
+                apply_fn=row_apply_fn, apply_label=human,
+                run_with_hardware=self._run_with_hardware,
+            )
             self._param_smu_key[key] = smu_key
-            self._param_current_value_widget[key] = cv_label
-            self._param_unit[key] = f" {unit}" if unit else ""
+            self._param_current_value_widget[key] = info["cv_label"]
+            self._param_unit[key] = info["unit_str"]
             self._detailed_param_widgets[key] = widget
             if od_limits is not None:
                 lk = limits_key if limits_key is not None else key
                 rng = od_limits.get_range(lk)
                 if rng is not None:
                     widget.setRange(rng[0], rng[1])
-            if row_apply_fn is not None:
-                btn = QPushButton("Set")
-                btn.setMaximumWidth(50)
-                _label = human
-                _fn = row_apply_fn
-                btn.clicked.connect(lambda checked=False, fn=_fn, lbl=_label:
-                                    self._run_with_hardware(f"Set {lbl}", fn, require_scan=False))
-                table.setCellWidget(row, 6, btn)
 
         def _mk_od_apply(od_attr, feature_bit, spin, label):
             def fn(hw):
@@ -1848,20 +1766,10 @@ class MainOverclockWidget(QWidget):
         od_w = QWidget()
         od_top_layout = QVBoxLayout(od_w)
 
-        hint_btn = QToolButton()
-        hint_btn.setIcon(self.style().standardIcon(
-            QStyle.StandardPixmap.SP_MessageBoxQuestion))
-        hint_btn.setIconSize(QSize(18, 18))
-        hint_btn.setToolTip("Open cheatsheet for OD")
-        hint_btn.setStyleSheet(
-            "QToolButton { border: none; background: transparent; }")
-        hint_btn.setCursor(Qt.CursorShape.WhatsThisCursor)
-        hint_btn.clicked.connect(
-            lambda: self._show_smu_cheatsheet("OD", OD_HELP_HTML))
-        hint_row = QHBoxLayout()
-        hint_row.addWidget(hint_btn)
-        hint_row.addWidget(QLabel("<b>OD — OverDrive Table</b>"))
-        hint_row.addStretch()
+        _, hint_row = make_cheatsheet_button(
+            self, "OD", OD_HELP_HTML, self._show_smu_cheatsheet,
+            label="OD \u2014 OverDrive Table",
+        )
         od_top_layout.addLayout(hint_row)
 
         od_table = QTableWidget()
@@ -1874,62 +1782,37 @@ class MainOverclockWidget(QWidget):
         od_table.horizontalHeader().setStretchLastSection(True)
         self._detailed_tables["OD"] = od_table
 
-        det_gfx_offset = QSpinBox()
-        det_gfx_offset.setRange(0, 2000)
-        det_gfx_offset.setValue(200)
-        det_gfx_offset.setSuffix(" MHz")
+        det_gfx_offset = make_spinbox(0, 2000, 200, " MHz")
         _add_od_row(od_table, "Gfxclk Offset", "GfxclkFoffset", "MHz", None, "od", det_gfx_offset,
                     row_apply_fn=_mk_od_apply("GfxclkFoffset", PP_OD_FEATURE_GFXCLK_BIT, det_gfx_offset, "Gfxclk Offset"),
                     feature_bit=PP_OD_FEATURE_GFXCLK_BIT)
 
-        det_od_ppt = QSpinBox()
-        det_od_ppt.setRange(-50, 100)
-        det_od_ppt.setValue(10)
-        det_od_ppt.setSuffix("%")
+        det_od_ppt = make_spinbox(-50, 100, 10, "%")
         _add_od_row(od_table, "PPT %", "Ppt", "%", None, "od", det_od_ppt,
                     row_apply_fn=_mk_od_apply("Ppt", PP_OD_FEATURE_PPT_BIT, det_od_ppt, "PPT %"),
                     feature_bit=PP_OD_FEATURE_PPT_BIT)
 
-        det_od_tdc = QSpinBox()
-        det_od_tdc.setRange(-50, 100)
-        det_od_tdc.setValue(0)
-        det_od_tdc.setSuffix("%")
+        det_od_tdc = make_spinbox(-50, 100, 0, "%")
         _add_od_row(od_table, "TDC %", "Tdc", "%", None, "od", det_od_tdc,
                     row_apply_fn=_mk_od_apply("Tdc", PP_OD_FEATURE_TDC_BIT, det_od_tdc, "TDC %"),
                     feature_bit=PP_OD_FEATURE_TDC_BIT)
 
-        det_uclk_min = QSpinBox()
-        det_uclk_min.setRange(0, 3000)
-        det_uclk_min.setValue(0)
-        det_uclk_min.setSpecialValueText("no change")
-        det_uclk_min.setSuffix(" MHz")
+        det_uclk_min = make_spinbox(0, 3000, 0, " MHz", "no change")
         _add_od_row(od_table, "UCLK min", "UclkFmin", "MHz", None, "od", det_uclk_min,
                     row_apply_fn=_mk_od_apply("UclkFmin", PP_OD_FEATURE_UCLK_BIT, det_uclk_min, "UCLK min"),
                     feature_bit=PP_OD_FEATURE_UCLK_BIT)
 
-        det_uclk_max = QSpinBox()
-        det_uclk_max.setRange(0, 3000)
-        det_uclk_max.setValue(0)
-        det_uclk_max.setSpecialValueText("no change")
-        det_uclk_max.setSuffix(" MHz")
+        det_uclk_max = make_spinbox(0, 3000, 0, " MHz", "no change")
         _add_od_row(od_table, "UCLK max", "UclkFmax", "MHz", None, "od", det_uclk_max,
                     row_apply_fn=_mk_od_apply("UclkFmax", PP_OD_FEATURE_UCLK_BIT, det_uclk_max, "UCLK max"),
                     feature_bit=PP_OD_FEATURE_UCLK_BIT)
 
-        det_fclk_min = QSpinBox()
-        det_fclk_min.setRange(0, 3000)
-        det_fclk_min.setValue(0)
-        det_fclk_min.setSpecialValueText("no change")
-        det_fclk_min.setSuffix(" MHz")
+        det_fclk_min = make_spinbox(0, 3000, 0, " MHz", "no change")
         _add_od_row(od_table, "FCLK min", "FclkFmin", "MHz", None, "od", det_fclk_min,
                     row_apply_fn=_mk_od_apply("FclkFmin", PP_OD_FEATURE_FCLK_BIT, det_fclk_min, "FCLK min"),
                     feature_bit=PP_OD_FEATURE_FCLK_BIT)
 
-        det_fclk_max = QSpinBox()
-        det_fclk_max.setRange(0, 3000)
-        det_fclk_max.setValue(0)
-        det_fclk_max.setSpecialValueText("no change")
-        det_fclk_max.setSuffix(" MHz")
+        det_fclk_max = make_spinbox(0, 3000, 0, " MHz", "no change")
         _add_od_row(od_table, "FCLK max", "FclkFmax", "MHz", None, "od", det_fclk_max,
                     row_apply_fn=_mk_od_apply("FclkFmax", PP_OD_FEATURE_FCLK_BIT, det_fclk_max, "FCLK max"),
                     feature_bit=PP_OD_FEATURE_FCLK_BIT)
@@ -1937,105 +1820,63 @@ class MainOverclockWidget(QWidget):
         for i in range(PP_NUM_OD_VF_CURVE_POINTS):
             key = f"VoltageOffsetZone{i}"
             self._param_od_array_spec[key] = ("VoltageOffsetPerZoneBoundary", i)
-            spin = QSpinBox()
-            spin.setRange(-500, 500)
-            spin.setValue(0)
-            spin.setSuffix(" mV")
+            spin = make_spinbox(-500, 500, 0, " mV")
             _add_od_row(od_table, f"V/F Zone {i}", key, "mV", None, "od", spin,
                         row_apply_fn=_mk_od_apply_array(
                             "VoltageOffsetPerZoneBoundary", i, PP_OD_FEATURE_GFX_VF_CURVE_BIT, spin, f"V/F Zone {i}"),
                         feature_bit=PP_OD_FEATURE_GFX_VF_CURVE_BIT, limits_key="VoltageOffsetPerZoneBoundary")
 
-        det_vdd_gfx = QSpinBox()
-        det_vdd_gfx.setRange(0, 2000)
-        det_vdd_gfx.setValue(0)
-        det_vdd_gfx.setSpecialValueText("no change")
-        det_vdd_gfx.setSuffix(" mV")
+        det_vdd_gfx = make_spinbox(0, 2000, 0, " mV", "no change")
         _add_od_row(od_table, "VddGfx Vmax", "VddGfxVmax", "mV", None, "od", det_vdd_gfx,
                     row_apply_fn=_mk_od_apply("VddGfxVmax", PP_OD_FEATURE_GFX_VMAX_BIT, det_vdd_gfx, "VddGfx Vmax"),
                     feature_bit=PP_OD_FEATURE_GFX_VMAX_BIT)
 
-        det_vdd_soc = QSpinBox()
-        det_vdd_soc.setRange(0, 2000)
-        det_vdd_soc.setValue(0)
-        det_vdd_soc.setSpecialValueText("no change")
-        det_vdd_soc.setSuffix(" mV")
+        det_vdd_soc = make_spinbox(0, 2000, 0, " mV", "no change")
         _add_od_row(od_table, "VddSoc Vmax", "VddSocVmax", "mV", None, "od", det_vdd_soc,
                     row_apply_fn=_mk_od_apply("VddSocVmax", PP_OD_FEATURE_SOC_VMAX_BIT, det_vdd_soc, "VddSoc Vmax"),
                     feature_bit=PP_OD_FEATURE_SOC_VMAX_BIT)
 
-        det_fan_target_temp = QSpinBox()
-        det_fan_target_temp.setRange(0, 120)
-        det_fan_target_temp.setValue(0)
-        det_fan_target_temp.setSpecialValueText("no change")
-        det_fan_target_temp.setSuffix(" °C")
+        det_fan_target_temp = make_spinbox(0, 120, 0, " °C", "no change")
         _add_od_row(od_table, "Fan Target Temp", "FanTargetTemperature", "°C", None, "od", det_fan_target_temp,
                     row_apply_fn=_mk_od_apply("FanTargetTemperature", PP_OD_FEATURE_FAN_CURVE_BIT, det_fan_target_temp, "Fan Target Temp"),
                     feature_bit=PP_OD_FEATURE_FAN_CURVE_BIT)
 
-        det_fan_min_pwm = QSpinBox()
-        det_fan_min_pwm.setRange(0, 255)
-        det_fan_min_pwm.setValue(0)
-        det_fan_min_pwm.setSpecialValueText("no change")
+        det_fan_min_pwm = make_spinbox(0, 255, 0, "", "no change")
         _add_od_row(od_table, "Fan Min PWM", "FanMinimumPwm", "", None, "od", det_fan_min_pwm,
                     row_apply_fn=_mk_od_apply("FanMinimumPwm", PP_OD_FEATURE_FAN_CURVE_BIT, det_fan_min_pwm, "Fan Min PWM"),
                     feature_bit=PP_OD_FEATURE_FAN_CURVE_BIT)
 
-        det_max_op_temp = QSpinBox()
-        det_max_op_temp.setRange(0, 127)
-        det_max_op_temp.setValue(0)
-        det_max_op_temp.setSpecialValueText("no change")
-        det_max_op_temp.setSuffix(" °C")
+        det_max_op_temp = make_spinbox(0, 127, 0, " °C", "no change")
         _add_od_row(od_table, "Max Op Temp", "MaxOpTemp", "°C", None, "od", det_max_op_temp,
                     row_apply_fn=_mk_od_apply("MaxOpTemp", PP_OD_FEATURE_TEMPERATURE_BIT, det_max_op_temp, "Max Op Temp"),
                     feature_bit=PP_OD_FEATURE_TEMPERATURE_BIT)
 
-        det_gfx_edc = QSpinBox()
-        det_gfx_edc.setRange(-32768, 32767)
-        det_gfx_edc.setValue(0)
-        det_gfx_edc.setSpecialValueText("no change")
+        det_gfx_edc = make_spinbox(-32768, 32767, 0, "", "no change")
         _add_od_row(od_table, "Gfx EDC", "GfxEdc", "", None, "od", det_gfx_edc,
                     row_apply_fn=_mk_od_apply("GfxEdc", PP_OD_FEATURE_EDC_BIT, det_gfx_edc, "Gfx EDC"),
                     feature_bit=PP_OD_FEATURE_EDC_BIT)
 
-        det_gfx_pcc = QSpinBox()
-        det_gfx_pcc.setRange(-32768, 32767)
-        det_gfx_pcc.setValue(0)
-        det_gfx_pcc.setSpecialValueText("no change")
+        det_gfx_pcc = make_spinbox(-32768, 32767, 0, "", "no change")
         _add_od_row(od_table, "Gfx PCC Limit", "GfxPccLimitControl", "", None, "od", det_gfx_pcc,
                     row_apply_fn=_mk_od_apply("GfxPccLimitControl", PP_OD_FEATURE_EDC_BIT, det_gfx_pcc, "Gfx PCC Limit"),
                     feature_bit=PP_OD_FEATURE_EDC_BIT)
 
-        det_gfx_fmax_vmax = QSpinBox()
-        det_gfx_fmax_vmax.setRange(0, 5000)
-        det_gfx_fmax_vmax.setValue(0)
-        det_gfx_fmax_vmax.setSpecialValueText("no change")
-        det_gfx_fmax_vmax.setSuffix(" MHz")
+        det_gfx_fmax_vmax = make_spinbox(0, 5000, 0, " MHz", "no change")
         _add_od_row(od_table, "Gfxclk Fmax@Vmax", "GfxclkFmaxVmax", "MHz", None, "od", det_gfx_fmax_vmax,
                     row_apply_fn=_mk_od_apply("GfxclkFmaxVmax", PP_OD_FEATURE_GFX_VMAX_BIT, det_gfx_fmax_vmax, "Gfxclk Fmax@Vmax"),
                     feature_bit=PP_OD_FEATURE_GFX_VMAX_BIT)
 
-        det_gfx_fmax_vmax_temp = QSpinBox()
-        det_gfx_fmax_vmax_temp.setRange(0, 127)
-        det_gfx_fmax_vmax_temp.setValue(0)
-        det_gfx_fmax_vmax_temp.setSpecialValueText("no change")
-        det_gfx_fmax_vmax_temp.setSuffix(" °C")
+        det_gfx_fmax_vmax_temp = make_spinbox(0, 127, 0, " °C", "no change")
         _add_od_row(od_table, "Gfxclk Fmax@Vmax Temp", "GfxclkFmaxVmaxTemperature", "°C", None, "od", det_gfx_fmax_vmax_temp,
                     row_apply_fn=_mk_od_apply("GfxclkFmaxVmaxTemperature", PP_OD_FEATURE_GFX_VMAX_BIT, det_gfx_fmax_vmax_temp, "Gfxclk Fmax@Vmax Temp"),
                     feature_bit=PP_OD_FEATURE_GFX_VMAX_BIT)
 
-        det_idle_pwr = QSpinBox()
-        det_idle_pwr.setRange(0, 255)
-        det_idle_pwr.setValue(0)
-        det_idle_pwr.setSpecialValueText("no change")
+        det_idle_pwr = make_spinbox(0, 255, 0, "", "no change")
         _add_od_row(od_table, "Idle Pwr Saving Ctrl", "IdlePwrSavingFeaturesCtrl", "", None, "od", det_idle_pwr,
                     row_apply_fn=_mk_od_apply("IdlePwrSavingFeaturesCtrl", PP_OD_FEATURE_FULL_CTRL_BIT, det_idle_pwr, "Idle Pwr Saving Ctrl"),
                     feature_bit=PP_OD_FEATURE_FULL_CTRL_BIT)
 
-        det_runtime_pwr = QSpinBox()
-        det_runtime_pwr.setRange(0, 255)
-        det_runtime_pwr.setValue(0)
-        det_runtime_pwr.setSpecialValueText("no change")
+        det_runtime_pwr = make_spinbox(0, 255, 0, "", "no change")
         _add_od_row(od_table, "Runtime Pwr Saving Ctrl", "RuntimePwrSavingFeaturesCtrl", "", None, "od", det_runtime_pwr,
                     row_apply_fn=_mk_od_apply("RuntimePwrSavingFeaturesCtrl", PP_OD_FEATURE_FULL_CTRL_BIT, det_runtime_pwr, "Runtime Pwr Saving Ctrl"),
                     feature_bit=PP_OD_FEATURE_FULL_CTRL_BIT)
@@ -2043,116 +1884,68 @@ class MainOverclockWidget(QWidget):
         for i in range(NUM_OD_FAN_MAX_POINTS):
             key_pwm = f"FanLinearPwm{i}"
             self._param_od_array_spec[key_pwm] = ("FanLinearPwmPoints", i)
-            spin = QSpinBox()
-            spin.setRange(0, 255)
-            spin.setValue(0)
-            spin.setSpecialValueText("no change")
+            spin = make_spinbox(0, 255, 0, "", "no change")
             _add_od_row(od_table, f"Fan PWM pt {i}", key_pwm, "%", None, "od", spin,
                         row_apply_fn=_mk_od_apply_array("FanLinearPwmPoints", i, PP_OD_FEATURE_FAN_CURVE_BIT, spin, f"Fan PWM pt {i}"),
                         feature_bit=PP_OD_FEATURE_FAN_CURVE_BIT, limits_key="FanLinearPwmPoints")
             key_temp = f"FanLinearTemp{i}"
             self._param_od_array_spec[key_temp] = ("FanLinearTempPoints", i)
-            spin_temp = QSpinBox()
-            spin_temp.setRange(0, 127)
-            spin_temp.setValue(0)
-            spin_temp.setSpecialValueText("no change")
-            spin_temp.setSuffix(" °C")
+            spin_temp = make_spinbox(0, 127, 0, " °C", "no change")
             _add_od_row(od_table, f"Fan Temp pt {i}", key_temp, "°C", None, "od", spin_temp,
                         row_apply_fn=_mk_od_apply_array("FanLinearTempPoints", i, PP_OD_FEATURE_FAN_CURVE_BIT, spin_temp, f"Fan Temp pt {i}"),
                         feature_bit=PP_OD_FEATURE_FAN_CURVE_BIT, limits_key="FanLinearTempPoints")
 
-        det_acoustic_target = QSpinBox()
-        det_acoustic_target.setRange(0, 65535)
-        det_acoustic_target.setValue(0)
-        det_acoustic_target.setSpecialValueText("no change")
-        det_acoustic_target.setSuffix(" RPM")
+        det_acoustic_target = make_spinbox(0, 65535, 0, " RPM", "no change")
         _add_od_row(od_table, "Acoustic Target RPM", "AcousticTargetRpmThreshold", " RPM", None, "od", det_acoustic_target,
                     row_apply_fn=_mk_od_apply("AcousticTargetRpmThreshold", PP_OD_FEATURE_FAN_CURVE_BIT, det_acoustic_target, "Acoustic Target RPM"),
                     feature_bit=PP_OD_FEATURE_FAN_CURVE_BIT)
 
-        det_acoustic_limit = QSpinBox()
-        det_acoustic_limit.setRange(0, 65535)
-        det_acoustic_limit.setValue(0)
-        det_acoustic_limit.setSpecialValueText("no change")
-        det_acoustic_limit.setSuffix(" RPM")
+        det_acoustic_limit = make_spinbox(0, 65535, 0, " RPM", "no change")
         _add_od_row(od_table, "Acoustic Limit RPM", "AcousticLimitRpmThreshold", " RPM", None, "od", det_acoustic_limit,
                     row_apply_fn=_mk_od_apply("AcousticLimitRpmThreshold", PP_OD_FEATURE_FAN_CURVE_BIT, det_acoustic_limit, "Acoustic Limit RPM"),
                     feature_bit=PP_OD_FEATURE_FAN_CURVE_BIT)
 
-        det_fan_zero_rpm = QSpinBox()
-        det_fan_zero_rpm.setRange(0, 1)
-        det_fan_zero_rpm.setValue(0)
-        det_fan_zero_rpm.setSpecialValueText("no change")
+        det_fan_zero_rpm = make_spinbox(0, 1, 0, "", "no change")
         _add_od_row(od_table, "Fan Zero RPM Enable", "FanZeroRpmEnable", "", None, "od", det_fan_zero_rpm,
                     row_apply_fn=_mk_od_apply("FanZeroRpmEnable", PP_OD_FEATURE_ZERO_FAN_BIT, det_fan_zero_rpm, "Fan Zero RPM Enable"),
                     feature_bit=PP_OD_FEATURE_ZERO_FAN_BIT)
 
-        det_fan_zero_stop = QSpinBox()
-        det_fan_zero_stop.setRange(0, 127)
-        det_fan_zero_stop.setValue(0)
-        det_fan_zero_stop.setSpecialValueText("no change")
-        det_fan_zero_stop.setSuffix(" °C")
+        det_fan_zero_stop = make_spinbox(0, 127, 0, " °C", "no change")
         _add_od_row(od_table, "Fan Zero RPM Stop Temp", "FanZeroRpmStopTemp", "°C", None, "od", det_fan_zero_stop,
                     row_apply_fn=_mk_od_apply("FanZeroRpmStopTemp", PP_OD_FEATURE_ZERO_FAN_BIT, det_fan_zero_stop, "Fan Zero RPM Stop Temp"),
                     feature_bit=PP_OD_FEATURE_ZERO_FAN_BIT)
 
-        det_fan_mode = QSpinBox()
-        det_fan_mode.setRange(0, 255)
-        det_fan_mode.setValue(0)
-        det_fan_mode.setSpecialValueText("no change")
+        det_fan_mode = make_spinbox(0, 255, 0, "", "no change")
         _add_od_row(od_table, "Fan Mode", "FanMode", "", None, "od", det_fan_mode,
                     row_apply_fn=_mk_od_apply("FanMode", PP_OD_FEATURE_FAN_CURVE_BIT, det_fan_mode, "Fan Mode"),
                     feature_bit=PP_OD_FEATURE_FAN_CURVE_BIT)
 
-        det_advanced_od = QSpinBox()
-        det_advanced_od.setRange(0, 1)
-        det_advanced_od.setValue(0)
-        det_advanced_od.setSpecialValueText("no change")
+        det_advanced_od = make_spinbox(0, 1, 0, "", "no change")
         _add_od_row(od_table, "Advanced OD Mode", "AdvancedOdModeEnabled", "", None, "od", det_advanced_od,
                     row_apply_fn=_mk_od_apply("AdvancedOdModeEnabled", PP_OD_FEATURE_FULL_CTRL_BIT, det_advanced_od, "Advanced OD Mode"),
                     feature_bit=PP_OD_FEATURE_FULL_CTRL_BIT)
 
-        det_gfx_volt_full = QSpinBox()
-        det_gfx_volt_full.setRange(0, 65535)
-        det_gfx_volt_full.setValue(0)
-        det_gfx_volt_full.setSpecialValueText("no change")
-        det_gfx_volt_full.setSuffix(" mV")
+        det_gfx_volt_full = make_spinbox(0, 65535, 0, " mV", "no change")
         _add_od_row(od_table, "Gfx Voltage Full Ctrl", "GfxVoltageFullCtrlMode", "mV", None, "od", det_gfx_volt_full,
                     row_apply_fn=_mk_od_apply("GfxVoltageFullCtrlMode", PP_OD_FEATURE_FULL_CTRL_BIT, det_gfx_volt_full, "Gfx Voltage Full Ctrl"),
                     feature_bit=PP_OD_FEATURE_FULL_CTRL_BIT)
 
-        det_soc_volt_full = QSpinBox()
-        det_soc_volt_full.setRange(0, 65535)
-        det_soc_volt_full.setValue(0)
-        det_soc_volt_full.setSpecialValueText("no change")
-        det_soc_volt_full.setSuffix(" mV")
+        det_soc_volt_full = make_spinbox(0, 65535, 0, " mV", "no change")
         _add_od_row(od_table, "Soc Voltage Full Ctrl", "SocVoltageFullCtrlMode", "mV", None, "od", det_soc_volt_full,
                     row_apply_fn=_mk_od_apply("SocVoltageFullCtrlMode", PP_OD_FEATURE_FULL_CTRL_BIT, det_soc_volt_full, "Soc Voltage Full Ctrl"),
                     feature_bit=PP_OD_FEATURE_FULL_CTRL_BIT)
 
-        det_gfxclk_full = QSpinBox()
-        det_gfxclk_full.setRange(0, 5000)
-        det_gfxclk_full.setValue(0)
-        det_gfxclk_full.setSpecialValueText("no change")
-        det_gfxclk_full.setSuffix(" MHz")
+        det_gfxclk_full = make_spinbox(0, 5000, 0, " MHz", "no change")
         _add_od_row(od_table, "Gfxclk Full Ctrl", "GfxclkFullCtrlMode", "MHz", None, "od", det_gfxclk_full,
                     row_apply_fn=_mk_od_apply("GfxclkFullCtrlMode", PP_OD_FEATURE_FULL_CTRL_BIT, det_gfxclk_full, "Gfxclk Full Ctrl"),
                     feature_bit=PP_OD_FEATURE_FULL_CTRL_BIT)
 
-        det_uclk_full = QSpinBox()
-        det_uclk_full.setRange(0, 3000)
-        det_uclk_full.setValue(0)
-        det_uclk_full.setSpecialValueText("no change")
-        det_uclk_full.setSuffix(" MHz")
+        det_uclk_full = make_spinbox(0, 3000, 0, " MHz", "no change")
         _add_od_row(od_table, "UCLK Full Ctrl", "UclkFullCtrlMode", "MHz", None, "od", det_uclk_full,
                     row_apply_fn=_mk_od_apply("UclkFullCtrlMode", PP_OD_FEATURE_FULL_CTRL_BIT, det_uclk_full, "UCLK Full Ctrl"),
                     feature_bit=PP_OD_FEATURE_FULL_CTRL_BIT)
 
-        det_fclk_full = QSpinBox()
-        det_fclk_full.setRange(0, 3000)
-        det_fclk_full.setValue(0)
-        det_fclk_full.setSpecialValueText("no change")
-        det_fclk_full.setSuffix(" MHz")
+        det_fclk_full = make_spinbox(0, 3000, 0, " MHz", "no change")
         _add_od_row(od_table, "FCLK Full Ctrl", "FclkFullCtrlMode", "MHz", None, "od", det_fclk_full,
                     row_apply_fn=_mk_od_apply("FclkFullCtrlMode", PP_OD_FEATURE_FULL_CTRL_BIT, det_fclk_full, "FCLK Full Ctrl"),
                     feature_bit=PP_OD_FEATURE_FULL_CTRL_BIT)
@@ -2200,27 +1993,16 @@ class MainOverclockWidget(QWidget):
             return t
 
         def _add_smu_row(table, human, key, unit, vb_val, widget, smu_key=None, row_apply_fn=None):
-            row = table.rowCount()
-            table.insertRow(row)
-            table.setItem(row, 0, QTableWidgetItem(human))
-            table.setItem(row, 1, QTableWidgetItem(key))
-            table.setItem(row, 2, QTableWidgetItem(unit))
-            cv_label = QLabel("—")
-            table.setCellWidget(row, 3, cv_label)
-            table.setCellWidget(row, 4, widget)
-            self._param_current_value_widget[key] = cv_label
-            self._param_unit[key] = f" {unit}" if unit else ""
+            info = add_param_row(
+                table, human, key, unit, widget,
+                apply_fn=row_apply_fn, apply_label=human,
+                run_with_hardware=self._run_with_hardware,
+            )
+            self._param_current_value_widget[key] = info["cv_label"]
+            self._param_unit[key] = info["unit_str"]
             self._detailed_param_widgets[key] = widget
             if smu_key:
                 self._param_smu_key[key] = smu_key
-            if row_apply_fn is not None:
-                btn = QPushButton("Set")
-                btn.setMaximumWidth(50)
-                _label = human
-                _fn = row_apply_fn
-                btn.clicked.connect(lambda checked=False, fn=_fn, lbl=_label:
-                                    self._run_with_hardware(f"Set {lbl}", fn, require_scan=False))
-                table.setCellWidget(row, 5, btn)
 
         def _add_refresh_btn(layout_target):
             btn = QPushButton("Refresh")
@@ -2233,21 +2015,9 @@ class MainOverclockWidget(QWidget):
             layout_target.addLayout(row)
 
         def _add_cheatsheet_btn(layout_target, tab_title, html_content):
-            btn = QToolButton()
-            btn.setIcon(self.style().standardIcon(
-                QStyle.StandardPixmap.SP_MessageBoxQuestion))
-            btn.setIconSize(QSize(18, 18))
-            btn.setToolTip(f"Open cheatsheet for {tab_title}")
-            btn.setStyleSheet(
-                "QToolButton { border: none; background: transparent; }")
-            btn.setCursor(Qt.CursorShape.WhatsThisCursor)
-            btn.clicked.connect(
-                lambda checked=False, t=tab_title, h=html_content:
-                    self._show_smu_cheatsheet(t, h))
-            row = QHBoxLayout()
-            row.addWidget(btn)
-            row.addWidget(QLabel(f"<b>{tab_title}</b>"))
-            row.addStretch()
+            _, row = make_cheatsheet_button(
+                self, tab_title, html_content, self._show_smu_cheatsheet,
+            )
             layout_target.addLayout(row)
 
         # ==================================================================
@@ -2373,19 +2143,14 @@ class MainOverclockWidget(QWidget):
 
                 input_row = QHBoxLayout()
                 input_row.setSpacing(2)
-                spin = QSpinBox()
-                spin.setRange(0, max_mhz)
-                spin.setValue(0)
-                spin.setSpecialValueText("—")
-                spin.setSuffix(" MHz")
+                spin = make_spinbox(0, max_mhz, 0, " MHz", "\u2014")
                 input_row.addWidget(spin)
 
-                set_btn = QPushButton("Set")
-                set_btn.setMaximumWidth(40)
                 _fn = _mk_freq_apply(_clk_id, _FREQ_MSG[lt], spin, clk_name, lt)
-                set_btn.clicked.connect(
-                    lambda checked=False, fn=_fn, lbl=f"{clk_name} {lt}":
-                        self._run_with_hardware(f"Set {lbl}", fn, require_scan=False))
+                set_btn = make_set_button(
+                    f"{clk_name} {lt}", _fn, self._run_with_hardware,
+                    max_width=40,
+                )
                 input_row.addWidget(set_btn)
                 cell_lay.addLayout(input_row)
 
@@ -2399,14 +2164,10 @@ class MainOverclockWidget(QWidget):
         # PPT Limit (single value, not per-limit-type)
         ppt_box = QGroupBox("PPT Limit")
         ppt_lay = QHBoxLayout(ppt_box)
-        ppt_cv_label = QLabel("—")
+        ppt_cv_label = make_current_value_label()
         ppt_lay.addWidget(QLabel("Current:"))
         ppt_lay.addWidget(ppt_cv_label)
-        smu_ppt_spin = QSpinBox()
-        smu_ppt_spin.setRange(0, 600)
-        smu_ppt_spin.setValue(0)
-        smu_ppt_spin.setSpecialValueText("—")
-        smu_ppt_spin.setSuffix(" W")
+        smu_ppt_spin = make_spinbox(0, 600, 0, " W", "\u2014")
         ppt_lay.addWidget(smu_ppt_spin)
 
         def _mk_ppt_apply(spin):
@@ -2417,11 +2178,9 @@ class MainOverclockWidget(QWidget):
                     self._log(f"SMU: PPT Limit = {v} W")
             return fn
 
-        ppt_set_btn = QPushButton("Set")
-        ppt_set_btn.setMaximumWidth(50)
-        ppt_set_btn.clicked.connect(
-            lambda checked=False, fn=_mk_ppt_apply(smu_ppt_spin):
-                self._run_with_hardware("Set PPT Limit", fn, require_scan=False))
+        ppt_set_btn = make_set_button(
+            "PPT Limit", _mk_ppt_apply(smu_ppt_spin), self._run_with_hardware,
+        )
         ppt_lay.addWidget(ppt_set_btn)
         ppt_lay.addStretch()
         clock_lay.addWidget(ppt_box)
@@ -2522,10 +2281,7 @@ class MainOverclockWidget(QWidget):
                     self._log(f"SMU: Temp input select = {v}")
             return fn
 
-        smu_temp_input = QSpinBox()
-        smu_temp_input.setRange(-1, 15)
-        smu_temp_input.setValue(-1)
-        smu_temp_input.setSpecialValueText("no change")
+        smu_temp_input = make_spinbox(-1, 15, -1, "", "no change")
         _add_smu_row(ctrl_tbl, "Temp Input Select", "SMU_TempInputSelect", "", None, smu_temp_input,
                      row_apply_fn=_mk_tempinput_apply(smu_temp_input))
 
@@ -2639,12 +2395,8 @@ class MainOverclockWidget(QWidget):
             feat_tbl.setCellWidget(row, 3, cb)
             self._detailed_param_widgets[f"SMU_FEAT_{bit}"] = cb
 
-            set_btn = QPushButton("Set")
-            set_btn.setMaximumWidth(50)
             _fn = _mk_feature_apply(bit, cb)
-            set_btn.clicked.connect(
-                lambda checked=False, fn=_fn, lbl=fname:
-                    self._run_with_hardware(f"Set {lbl}", fn, require_scan=False))
+            set_btn = make_set_button(fname, _fn, self._run_with_hardware)
             feat_tbl.setCellWidget(row, 4, set_btn)
 
         feat_tbl.resizeRowsToContents()
@@ -2679,10 +2431,7 @@ class MainOverclockWidget(QWidget):
         self._smu_metrics_auto_cb.toggled.connect(self._on_smu_metrics_auto_toggle)
         metrics_ctrl_row.addWidget(self._smu_metrics_auto_cb)
 
-        self._smu_metrics_interval_spin = QSpinBox()
-        self._smu_metrics_interval_spin.setRange(1, 30)
-        self._smu_metrics_interval_spin.setValue(2)
-        self._smu_metrics_interval_spin.setSuffix(" s")
+        self._smu_metrics_interval_spin = make_spinbox(1, 30, 2, " s")
         self._smu_metrics_interval_spin.setToolTip("Auto-refresh interval in seconds")
         self._smu_metrics_interval_spin.valueChanged.connect(
             self._on_smu_metrics_interval_changed)
@@ -2995,21 +2744,10 @@ class MainOverclockWidget(QWidget):
         info_label.setStyleSheet("color: #888; font-size: 9pt;")
         layout.addWidget(info_label)
 
-        # Cheatsheet button
-        hint_btn = QToolButton()
-        hint_btn.setIcon(self.style().standardIcon(
-            QStyle.StandardPixmap.SP_MessageBoxQuestion))
-        hint_btn.setIconSize(QSize(18, 18))
-        hint_btn.setToolTip("Open cheatsheet for Registry Patch")
-        hint_btn.setStyleSheet(
-            "QToolButton { border: none; background: transparent; }")
-        hint_btn.setCursor(Qt.CursorShape.WhatsThisCursor)
-        hint_btn.clicked.connect(
-            lambda: self._show_smu_cheatsheet(
-                "Registry Patch", REG_CHEATSHEET_HTML))
-        hint_row = QHBoxLayout()
-        hint_row.addWidget(hint_btn)
-        hint_row.addStretch()
+        _, hint_row = make_cheatsheet_button(
+            self, "Registry Patch", REG_CHEATSHEET_HTML,
+            self._show_smu_cheatsheet, label="",
+        )
         layout.addLayout(hint_row)
 
         # Table: Name, Current, Custom
@@ -3070,22 +2808,12 @@ class MainOverclockWidget(QWidget):
         )
         layout.addWidget(header)
 
-        help_btn = QToolButton()
-        help_btn.setIcon(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxQuestion)
+        _, help_row = make_cheatsheet_button(
+            self, "VRAM Dump", DIAG_VRAM_DUMP_HTML,
+            self._show_smu_cheatsheet,
+            tooltip="What does VRAM Dump do?",
+            label="What is this?",
         )
-        help_btn.setIconSize(QSize(16, 16))
-        help_btn.setToolTip("What does VRAM Dump do?")
-        help_btn.setStyleSheet("QToolButton { border: none; background: transparent; }")
-        help_btn.setCursor(Qt.CursorShape.WhatsThisCursor)
-        help_btn.clicked.connect(
-            lambda: self._show_smu_cheatsheet(
-                "VRAM Dump", DIAG_VRAM_DUMP_HTML))
-
-        help_row = QHBoxLayout()
-        help_row.addWidget(help_btn)
-        help_row.addWidget(QLabel("<b>What is this?</b>"))
-        help_row.addStretch()
         layout.addLayout(help_row)
 
         # Save path row
@@ -3344,10 +3072,8 @@ class MainOverclockWidget(QWidget):
             cur_label.setEnabled(False)
             cur_label.setToolTip("Current registry value (read-only)")
             self.reg_table.setCellWidget(row, 1, cur_label)
-            spin = QSpinBox()
-            spin.setRange(min_val, max_val)
-            spin.setValue(current if current is not None else 0)
-            spin.setToolTip(f"Value to apply ({min_val}–{max_val})")
+            spin = make_spinbox(min_val, max_val, current if current is not None else 0)
+            spin.setToolTip(f"Value to apply ({min_val}\u2013{max_val})")
             self._reg_widgets[name] = spin
             self.reg_table.setCellWidget(row, 2, spin)
 
