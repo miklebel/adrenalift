@@ -52,6 +52,7 @@ a = Analysis(
         "src",
         "src.app",
         "src.app.main",
+        "src.app.workers",
         "src.engine",
         "src.engine.overclock_engine",
         "src.engine.od_table",
