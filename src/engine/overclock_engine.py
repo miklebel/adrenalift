@@ -1390,17 +1390,31 @@ def vram_scan_for_dma(smu, inpout, vram_bar, vbios_values=None,
         scan_limit = min(vram_size, 0x400000000)  # cap at 16 GB
         total_chunks = (scan_limit + CHUNK - 1) // CHUNK
 
-        _elog(f"vram_scan_for_dma: scanning {total_chunks} x 4 MB chunks "
-              f"({scan_limit / (1 << 20):.0f} MB)")
+        # Build interleaved scan order: alternate bottom/top converging
+        # toward the middle.  DMA buffers tend to sit near either end of
+        # VRAM, so this finds them much faster than a linear sweep.
+        scan_order = []
+        lo, hi = 0, total_chunks - 1
+        while lo <= hi:
+            scan_order.append(lo)
+            if hi != lo:
+                scan_order.append(hi)
+            lo += 1
+            hi -= 1
 
-        for ci in range(total_chunks):
+        _elog(f"vram_scan_for_dma: scanning {total_chunks} x 4 MB chunks "
+              f"({scan_limit / (1 << 20):.0f} MB) [interleaved bottom/top]")
+
+        for done, ci in enumerate(scan_order):
             chunk_base = ci * CHUNK
             chunk_sz = min(CHUNK, scan_limit - chunk_base)
 
-            pct = 8 + (ci / total_chunks) * 82  # progress 8-90%
-            if ci % 4 == 0 or ci == total_chunks - 1:
-                scanned_mb = chunk_base / (1 << 20)
-                cb(pct, f"Scanning VRAM: {scanned_mb:.0f} / {scan_limit / (1 << 20):.0f} MB")
+            pct = 8 + (done / total_chunks) * 82  # progress 8-90%
+            if done % 4 == 0 or done == total_chunks - 1:
+                scanned_mb = (done + 1) * CHUNK / (1 << 20)
+                total_mb = scan_limit / (1 << 20)
+                cb(pct, f"Scanning VRAM: {scanned_mb:.0f} / {total_mb:.0f} MB "
+                        f"(chunk 0x{chunk_base:X})")
 
             try:
                 cv, ch = inpout.map_phys(vram_bar + chunk_base, chunk_sz)
