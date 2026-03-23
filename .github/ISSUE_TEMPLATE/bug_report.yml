@@ -1,0 +1,102 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please fill out the sections below so we can reproduce and fix the issue.
+
+  - type: input
+    id: version
+    attributes:
+      label: Adrenalift Version
+      description: Which version are you running? (e.g., v0.1)
+      placeholder: v0.1
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU Model
+      description: "Your AMD GPU model (e.g., RX 9070 XT)"
+      placeholder: RX 9070 XT
+    validations:
+      required: true
+
+  - type: input
+    id: driver
+    attributes:
+      label: AMD Driver Version
+      description: "Adrenalin driver version (e.g., 25.3.1)"
+      placeholder: "25.3.1"
+    validations:
+      required: true
+
+  - type: input
+    id: windows
+    attributes:
+      label: Windows Version
+      description: "Windows version and build (run `winver`)"
+      placeholder: "Windows 11 24H2 (Build 26100)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the bug clearly. What did you expect vs. what actually happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: How can we reproduce this? Be as specific as possible.
+      placeholder: |
+        1. Open Adrenalift
+        2. Go to the Simple tab
+        3. Set boost clock to ...
+        4. Click Apply
+        5. ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      options:
+        - Crash / BSOD
+        - Display corruption
+        - Feature not working
+        - UI issue
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log File
+      description: |
+        Please attach or paste the contents of `overclock_log.txt`.
+        This file is located in the **same folder as the Adrenalift executable**.
+        It contains timestamped session logs, exception tracebacks, and Qt warnings
+        that are essential for diagnosing issues.
+
+        > **Tip:** You can drag-and-drop the file into this text box to upload it.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: Screenshots, VBIOS info, settings.json contents, or anything else that might help.
+    validations:
+      required: false
