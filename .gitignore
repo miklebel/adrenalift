@@ -4,3 +4,5 @@
 /dist
 /.cursor
 /src/tools/*
+!/src/tools/__init__.py
+!/src/tools/reg_patch.py
