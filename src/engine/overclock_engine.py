@@ -23,6 +23,7 @@ printing directly, so callers control presentation.
 Safe: Non-persistent.  Reboot always restores stock values.
 """
 
+import gc
 import json
 import logging
 import multiprocessing as mp
@@ -88,6 +89,9 @@ POWER_PATTERN = struct.pack('<4H',
     ORIG_POWER_AC, ORIG_POWER_DC, 1200, 1200)
 
 CHUNK_SIZE = 2 * 1024 * 1024  # 2 MB per scan chunk
+
+_INC_TABLE = bytes((i + 1) & 0xFF for i in range(256))
+_DEC_TABLE = bytes((i - 1) & 0xFF for i in range(256))
 
 # MsgLimits_t field offsets (relative to MsgLimits start)
 ML_PPT0_AC  = 0
@@ -221,7 +225,7 @@ class OverclockSettings:
 @dataclass
 class ScanOptions:
     """Controls for the memory scanning strategy."""
-    max_gb: int = 32
+    max_gb: int = 0
     num_threads: int = 0
     fast_window_mb: int = 512
 
@@ -1107,6 +1111,288 @@ def validated_patch_u16(inpout, phys_addr, offset, expected_old, new_val):
 
 
 # ---------------------------------------------------------------------------
+# Firmware physical-RAM map
+# ---------------------------------------------------------------------------
+
+_CM_RESOURCE_TYPE_MEMORY       = 3
+_CM_RESOURCE_TYPE_MEMORY_LARGE = 7
+_CM_RESOURCE_MEMORY_LARGE_40   = 0x0200
+_CM_RESOURCE_MEMORY_LARGE_48   = 0x0400
+_CM_RESOURCE_MEMORY_LARGE_64   = 0x0800
+
+def get_physical_ram_ranges():
+    """Read firmware-reported physical RAM ranges from the Windows registry.
+
+    Parses the CM_RESOURCE_LIST stored at:
+        HKLM\\HARDWARE\\RESOURCEMAP\\System Resources\\Physical Memory\\.Translated
+
+    Returns a sorted list of (start_phys, end_phys) tuples on success,
+    or None on any failure (non-Windows, permission denied, parse error).
+    """
+    try:
+        import winreg
+    except ImportError:
+        _elog("get_physical_ram_ranges: winreg unavailable (non-Windows)")
+        return None
+
+    _REG_KEY = r"HARDWARE\RESOURCEMAP\System Resources\Physical Memory"
+    _REG_VAL = ".Translated"
+
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE, _REG_KEY, 0, winreg.KEY_READ
+        ) as key:
+            raw, regtype = winreg.QueryValueEx(key, _REG_VAL)
+    except OSError as exc:
+        _elog(f"get_physical_ram_ranges: registry open failed: {exc}")
+        return None
+
+    if not isinstance(raw, bytes) or len(raw) < 16:
+        _elog(f"get_physical_ram_ranges: unexpected data type/size ({type(raw).__name__}, {len(raw) if isinstance(raw, bytes) else '?'})")
+        return None
+
+    try:
+        ranges = _parse_cm_resource_list(raw)
+    except Exception as exc:
+        _elog(f"get_physical_ram_ranges: parse error: {exc}")
+        return None
+
+    if not ranges:
+        _elog("get_physical_ram_ranges: no CmResourceTypeMemory entries found")
+        return None
+
+    ranges.sort()
+    _elog(f"get_physical_ram_ranges: {len(ranges)} range(s) from firmware")
+    for start, end in ranges:
+        size_mb = (end - start + 1) / (1024 * 1024)
+        _elog(f"  0x{start:09X}-0x{end:09X} ({size_mb:.1f} MB)")
+    return ranges
+
+
+def _parse_cm_resource_list(data):
+    """Parse a CM_RESOURCE_LIST binary blob into [(start, end), ...].
+
+    Layout (all little-endian):
+      CM_RESOURCE_LIST:
+        u32  Count                           (number of full descriptors)
+        CM_FULL_RESOURCE_DESCRIPTOR[Count]:
+          u8   InterfaceType
+          u32  BusNumber
+          CM_PARTIAL_RESOURCE_LIST:
+            u16  Version
+            u16  Revision
+            u32  Count                       (number of partial descriptors)
+            CM_PARTIAL_RESOURCE_DESCRIPTOR[Count]:   (each 16 bytes)
+              u8   Type       -- 3 = Memory, 7 = MemoryLarge
+              u8   ShareDisposition
+              u16  Flags      -- encodes Large40/48/64 variant
+              u64  Start      (PHYSICAL_ADDRESS)
+              u32  Length     -- raw; shifted for MemoryLarge
+    """
+    off = 0
+
+    if len(data) < off + 4:
+        raise ValueError("truncated: no CM_RESOURCE_LIST.Count")
+    list_count = struct.unpack_from("<I", data, off)[0]
+    off += 4
+
+    ranges = []
+
+    for _ in range(list_count):
+        # CM_FULL_RESOURCE_DESCRIPTOR header: InterfaceType(u8) + 3 pad + BusNumber(u32)
+        if len(data) < off + 8:
+            raise ValueError("truncated: CM_FULL_RESOURCE_DESCRIPTOR header")
+        off += 8  # skip InterfaceType(4 bytes with alignment) + BusNumber(4)
+
+        # CM_PARTIAL_RESOURCE_LIST header
+        if len(data) < off + 8:
+            raise ValueError("truncated: CM_PARTIAL_RESOURCE_LIST header")
+        _ver, _rev, partial_count = struct.unpack_from("<HHI", data, off)
+        off += 8
+
+        for _ in range(partial_count):
+            if len(data) < off + 16:
+                raise ValueError("truncated: CM_PARTIAL_RESOURCE_DESCRIPTOR")
+            rtype  = struct.unpack_from("<B", data, off)[0]
+            flags  = struct.unpack_from("<H", data, off + 2)[0]
+            start  = struct.unpack_from("<Q", data, off + 4)[0]
+            length = struct.unpack_from("<I", data, off + 12)[0]
+            off += 16
+
+            if rtype == _CM_RESOURCE_TYPE_MEMORY and length > 0:
+                ranges.append((start, start + length - 1))
+            elif rtype == _CM_RESOURCE_TYPE_MEMORY_LARGE and length > 0:
+                if flags & _CM_RESOURCE_MEMORY_LARGE_64:
+                    actual = length << 32
+                elif flags & _CM_RESOURCE_MEMORY_LARGE_48:
+                    actual = length << 16
+                elif flags & _CM_RESOURCE_MEMORY_LARGE_40:
+                    actual = length << 8
+                else:
+                    actual = length
+                ranges.append((start, start + actual - 1))
+
+    return ranges
+
+
+_FOUR_GB = 0x100000000
+_FALLBACK_MMIO_HOLE = (0xC0000000, 0xFFFFFFFF)
+_FALLBACK_MAX_GB = 32
+
+
+def _get_total_physical_memory():
+    """Return total installed physical RAM in bytes, or None on failure."""
+    try:
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        stat = MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(stat)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+            return stat.ullTotalPhys
+    except Exception:
+        pass
+    return None
+
+
+def _find_mmio_hole(ram_ranges):
+    """Derive the PCI MMIO hole from firmware RAM ranges.
+
+    The hole is the gap between the top of the highest below-4 GB RAM
+    range and 0xFFFFFFFF.  Returns (hole_start, hole_end) or None.
+
+    When firmware ranges are incomplete (common on some BIOSes that only
+    enumerate a subset of physical RAM in the .Translated resource list),
+    the derived hole start can be much lower than the real MMIO window.
+    On systems with >4 GB RAM the hole is clamped to at least 0xC0000000
+    (the standard PCI MMIO base on x86) so that legitimate RAM between
+    the firmware top and 0xC0000000 is not skipped.
+    """
+    if not ram_ranges:
+        return None
+    top = 0
+    for start, end in ram_ranges:
+        if start < _FOUR_GB:
+            top = max(top, min(end, _FOUR_GB - 1))
+    if top == 0:
+        return None
+    hole_start = (top + 1 + CHUNK_SIZE - 1) & ~(CHUNK_SIZE - 1)
+
+    if hole_start < _FALLBACK_MMIO_HOLE[0]:
+        total_phys = _get_total_physical_memory()
+        if total_phys is not None and total_phys > _FOUR_GB:
+            _elog(f"_find_mmio_hole: firmware top 0x{top:09X} yields "
+                  f"0x{hole_start:09X}, below standard "
+                  f"0x{_FALLBACK_MMIO_HOLE[0]:09X} on "
+                  f"{total_phys / (1024**3):.1f} GB system — "
+                  f"clamping to standard MMIO base")
+            hole_start = _FALLBACK_MMIO_HOLE[0]
+
+    hole_end = _FOUR_GB - 1
+    if hole_start >= hole_end:
+        return None
+    return (hole_start, hole_end)
+
+
+def _compute_scan_ceiling(ram_ranges):
+    """Determine the physical address ceiling for scanning.
+
+    Prefers the firmware range ceiling, but cross-checks with
+    GlobalMemoryStatusEx.  When the firmware map appears incomplete
+    (only lists low-memory ranges while the system clearly has more RAM),
+    reconstructs the ceiling from total physical memory + MMIO hole size.
+    """
+    fw_ceiling = 0
+    if ram_ranges:
+        fw_ceiling = max(end for _, end in ram_ranges) + 1
+
+    total_phys = _get_total_physical_memory()
+    if total_phys is None or total_phys <= fw_ceiling:
+        _elog(f"_compute_scan_ceiling: fw={fw_ceiling / (1024 ** 3):.1f} GB, "
+              f"os={total_phys / (1024 ** 3):.1f} GB (using firmware)"
+              if total_phys else
+              f"_compute_scan_ceiling: fw={fw_ceiling / (1024 ** 3):.1f} GB, "
+              f"os=unavailable (using firmware)")
+        return fw_ceiling
+
+    low_ram = 0
+    if ram_ranges:
+        for start, end in ram_ranges:
+            if start < _FOUR_GB:
+                low_ram += min(end, _FOUR_GB - 1) - start + 1
+
+    high_ram = total_phys - low_ram
+    ceiling = _FOUR_GB + high_ram if high_ram > 0 else total_phys
+    _elog(f"_compute_scan_ceiling: fw={fw_ceiling / (1024 ** 3):.1f} GB, "
+          f"os={total_phys / (1024 ** 3):.1f} GB, "
+          f"low_ram={low_ram / (1024 ** 3):.1f} GB → "
+          f"ceiling={ceiling / (1024 ** 3):.1f} GB "
+          f"(firmware ranges incomplete, using OS total)")
+    return ceiling
+
+
+def _is_scannable(phys, mmio_hole):
+    """True unless *phys* falls inside the MMIO hole."""
+    if mmio_hole is None:
+        return True
+    return not (mmio_hole[0] <= phys <= mmio_hole[1])
+
+
+def _build_scannable_chunks(max_gb, ram_ranges):
+    """Build the list of chunk indices to scan.
+
+    Scans from address 0 up to the RAM ceiling, **excluding only the PCI
+    MMIO hole** derived from the firmware map.  The ceiling is the higher
+    of the firmware range extent and the OS-reported total physical memory
+    (adjusted for the MMIO hole).
+
+    When *ram_ranges* is None (registry read failed), falls back to the
+    hardcoded 0xC0000000-0xFFFFFFFF exclusion with a *_FALLBACK_MAX_GB*
+    ceiling.
+
+    *max_gb* of 0 means "auto": computed ceiling, or *_FALLBACK_MAX_GB*
+    when firmware is unavailable.
+    """
+    if ram_ranges is None:
+        effective_gb = max_gb if max_gb > 0 else _FALLBACK_MAX_GB
+        max_bytes = effective_gb * 1024 * 1024 * 1024
+        total_chunks = max_bytes // CHUNK_SIZE
+        chunk_indices = []
+        for ci in range(total_chunks):
+            phys_base = ci * CHUNK_SIZE
+            if _FALLBACK_MMIO_HOLE[0] <= phys_base <= _FALLBACK_MMIO_HOLE[1]:
+                continue
+            chunk_indices.append(ci)
+        return chunk_indices
+
+    ceiling = _compute_scan_ceiling(ram_ranges)
+    if max_gb > 0:
+        ceiling = min(ceiling, max_gb * 1024 * 1024 * 1024)
+
+    mmio_hole = _find_mmio_hole(ram_ranges)
+    total_chunks = (ceiling + CHUNK_SIZE - 1) // CHUNK_SIZE
+    chunk_indices = []
+    for ci in range(total_chunks):
+        phys_base = ci * CHUNK_SIZE
+        if mmio_hole and mmio_hole[0] <= phys_base <= mmio_hole[1]:
+            continue
+        chunk_indices.append(ci)
+    return chunk_indices
+
+
+# ---------------------------------------------------------------------------
 # Memory scanning primitives
 # ---------------------------------------------------------------------------
 
@@ -1119,6 +1405,45 @@ _mp_inpout = None
 _mp_progress = None
 
 
+_DEEP_PROBE_SIZE = 4096
+
+
+def _probe_phys_region(dll_path, phys_addr, size):
+    """Subprocess target: map phys_addr and memmove *size* bytes.
+
+    Exits 0 on success.  If the physical page is unmapped / MMIO the
+    memmove triggers an access-violation that kills *this* process (exit
+    code != 0) without affecting the parent.
+    """
+    inp = InpOut32(dll_path=dll_path)
+    page_base = phys_addr & ~0xFFF
+    page_off = phys_addr - page_base
+    map_size = ((page_off + size + 0xFFF) // 0x1000) * 0x1000
+    virt, handle = inp.map_phys(page_base, map_size)
+    try:
+        buf = (ctypes.c_ubyte * size)()
+        ctypes.memmove(buf, virt + page_off, size)
+    finally:
+        inp.unmap_phys(virt, handle)
+
+
+def probe_phys_readable(inpout, phys_addr, size=_DEEP_PROBE_SIZE, timeout=5.0):
+    """Check if *size* bytes at *phys_addr* are readable without AV.
+
+    Runs the read in a disposable subprocess so an access-violation kills
+    the child, not the caller.  Returns True if the read succeeded.
+    """
+    p = mp.Process(target=_probe_phys_region,
+                   args=(inpout._dll._name, phys_addr, size))
+    p.start()
+    p.join(timeout=timeout)
+    if p.is_alive():
+        p.terminate()
+        p.join()
+        return False
+    return p.exitcode == 0
+
+
 def _mp_init_worker(dll_path, progress_counter):
     """Per-process initializer: load InpOut32 and store shared counter."""
     global _mp_inpout, _mp_progress
@@ -1126,8 +1451,14 @@ def _mp_init_worker(dll_path, progress_counter):
     _mp_progress = progress_counter
 
 
-def _mp_scan_range(indices, patterns):
-    """Scan a range of chunk indices in a worker process."""
+def _mp_scan_range(indices, inc_patterns):
+    """Scan a range of chunk indices in a worker process.
+
+    Receives pre-incremented patterns (+1 per byte).  Physical memory is
+    also incremented via translate() before comparison, so the real search
+    pattern never appears in the worker heap — eliminating ghost matches
+    from self-contamination.
+    """
     local_found = []
     for ci in indices:
         phys_base = ci * CHUNK_SIZE
@@ -1141,13 +1472,14 @@ def _mp_scan_range(indices, patterns):
             buf = (ctypes.c_ubyte * CHUNK_SIZE)()
             ctypes.memmove(buf, virt, CHUNK_SIZE)
             data = bytes(buf)
-            for pattern in patterns:
+            inc_data = data.translate(_INC_TABLE)
+            for pi, inc_pat in enumerate(inc_patterns):
                 pos = 0
                 while True:
-                    idx = data.find(pattern, pos)
+                    idx = inc_data.find(inc_pat, pos)
                     if idx < 0:
                         break
-                    local_found.append((phys_base + idx, pattern))
+                    local_found.append((phys_base + idx, pi))
                     pos = idx + 2
         finally:
             _mp_inpout.unmap_phys(virt, handle)
@@ -1156,7 +1488,7 @@ def _mp_scan_range(indices, patterns):
     return local_found
 
 
-def _mp_scan_range_windows(phys_bases, patterns):
+def _mp_scan_range_windows(phys_bases, inc_patterns):
     """Scan physical base addresses in a worker process (window scan)."""
     local_found = []
     for phys_base in phys_bases:
@@ -1170,13 +1502,14 @@ def _mp_scan_range_windows(phys_bases, patterns):
             buf = (ctypes.c_ubyte * CHUNK_SIZE)()
             ctypes.memmove(buf, virt, CHUNK_SIZE)
             data = bytes(buf)
-            for pattern in patterns:
+            inc_data = data.translate(_INC_TABLE)
+            for pi, inc_pat in enumerate(inc_patterns):
                 pos = 0
                 while True:
-                    idx = data.find(pattern, pos)
+                    idx = inc_data.find(inc_pat, pos)
                     if idx < 0:
                         break
-                    local_found.append((phys_base + idx, pattern))
+                    local_found.append((phys_base + idx, pi))
                     pos = idx + 2
         finally:
             _mp_inpout.unmap_phys(virt, handle)
@@ -1185,13 +1518,20 @@ def _mp_scan_range_windows(phys_bases, patterns):
     return local_found
 
 
-def scan_memory(inpout, patterns, max_gb=16, num_threads=0,
-                progress_callback=None):
+def scan_memory(inpout, patterns, max_gb=0, num_threads=0,
+                progress_callback=None, _inc_patterns=None):
     """Scan physical memory for byte patterns using worker processes.
 
-    Uses ProcessPoolExecutor for true CPU parallelism -- each worker runs
-    in its own process with its own GIL and InpOut32 DLL handle.  Falls
-    back to ThreadPoolExecutor if process spawning fails.
+    Uses ProcessPoolExecutor for true CPU parallelism.  Patterns are
+    byte-incremented (+1 per byte) before dispatch so the real search
+    pattern never appears in worker heaps — eliminating ghost matches
+    from self-contamination.  Falls back to ThreadPoolExecutor if
+    process spawning fails.
+
+    If *_inc_patterns* is provided, uses them directly (caller already
+    incremented the patterns and scrubbed originals from the heap).
+
+    *max_gb* of 0 (default) means auto-detect from firmware RAM map.
 
     Returns list of (phys_addr, matched_pattern) tuples.
     progress_callback(pct, msg) is called periodically during the scan.
@@ -1199,15 +1539,40 @@ def scan_memory(inpout, patterns, max_gb=16, num_threads=0,
     if isinstance(patterns, bytes):
         patterns = [patterns]
     cb = progress_callback or _noop_cb
-    max_bytes = max_gb * 1024 * 1024 * 1024
-    total_chunks = max_bytes // CHUNK_SIZE
 
-    chunk_indices = []
-    for ci in range(total_chunks):
-        phys_base = ci * CHUNK_SIZE
-        if 0xC0000000 <= phys_base < 0x100000000:
-            continue
-        chunk_indices.append(ci)
+    ram_ranges = get_physical_ram_ranges()
+    chunk_indices = _build_scannable_chunks(max_gb, ram_ranges)
+    scannable_gb = len(chunk_indices) * CHUNK_SIZE / (1024 ** 3)
+
+    if ram_ranges is not None:
+        range_strs = [
+            f"0x{s:09X}-0x{e:09X} ({(e - s + 1) / (1024 ** 3):.1f} GB)"
+            for s, e in ram_ranges
+        ]
+        mmio_hole = _find_mmio_hole(ram_ranges)
+        ceiling = _compute_scan_ceiling(ram_ranges)
+        if max_gb > 0:
+            ceiling = min(ceiling, max_gb * 1024 * 1024 * 1024)
+        map_line = f"Physical RAM map: {', '.join(range_strs)}"
+        if mmio_hole:
+            hole_mb = (mmio_hole[1] - mmio_hole[0] + 1) / (1024 * 1024)
+            hole_line = (f"MMIO hole: 0x{mmio_hole[0]:09X}-0x{mmio_hole[1]:09X} "
+                         f"({hole_mb:.0f} MB excluded)")
+        else:
+            hole_line = "MMIO hole: not detected"
+        scan_line = (f"Scannable: {scannable_gb:.1f} GB, "
+                     f"ceiling 0x{ceiling:09X} "
+                     f"({ceiling / (1024 ** 3):.1f} GB)")
+        for msg in (map_line, hole_line, scan_line):
+            _elog(msg)
+            cb(0, msg)
+    else:
+        effective = max_gb if max_gb > 0 else _FALLBACK_MAX_GB
+        fallback_msg = (f"Physical RAM map: unavailable, using hardcoded "
+                        f"MMIO exclusion (0xC0000000-0xFFFFFFFF), "
+                        f"ceiling {effective} GB")
+        _elog(fallback_msg)
+        cb(0, fallback_msg)
 
     scannable = len(chunk_indices)
 
@@ -1221,6 +1586,7 @@ def scan_memory(inpout, patterns, max_gb=16, num_threads=0,
     ranges = [r for r in ranges if r]
 
     t0 = time.perf_counter()
+    inc_patterns = _inc_patterns or [p.translate(_INC_TABLE) for p in patterns]
 
     try:
         dll_path = inpout._dll._name
@@ -1232,7 +1598,7 @@ def scan_memory(inpout, patterns, max_gb=16, num_threads=0,
             initializer=_mp_init_worker,
             initargs=(dll_path, shared_progress),
         ) as pool:
-            futures = [pool.submit(_mp_scan_range, r, patterns)
+            futures = [pool.submit(_mp_scan_range, r, inc_patterns)
                        for r in ranges]
 
             while not all(f.done() for f in futures):
@@ -1267,13 +1633,14 @@ def scan_memory(inpout, patterns, max_gb=16, num_threads=0,
                     buf = (ctypes.c_ubyte * CHUNK_SIZE)()
                     ctypes.memmove(buf, virt, CHUNK_SIZE)
                     data = bytes(buf)
-                    for pattern in patterns:
+                    inc_data = data.translate(_INC_TABLE)
+                    for pi, inc_pat in enumerate(inc_patterns):
                         pos = 0
                         while True:
-                            idx = data.find(pattern, pos)
+                            idx = inc_data.find(inc_pat, pos)
                             if idx < 0:
                                 break
-                            local_found.append((phys_base + idx, pattern))
+                            local_found.append((phys_base + idx, pi))
                             pos = idx + 2
                 finally:
                     inpout.unmap_phys(virt, handle)
@@ -1299,6 +1666,8 @@ def scan_memory(inpout, patterns, max_gb=16, num_threads=0,
             for fut in as_completed(futures):
                 all_found.extend(fut.result())
 
+    all_found = [(addr, patterns[pi]) for addr, pi in all_found]
+
     seen = set()
     deduped = []
     for addr, pat in all_found:
@@ -1315,11 +1684,12 @@ def scan_memory(inpout, patterns, max_gb=16, num_threads=0,
 
 def scan_memory_windows(inpout, patterns, centers, window_mb=512,
                         max_centers=None, num_threads=0,
-                        progress_callback=None):
+                        progress_callback=None, _inc_patterns=None):
     """Scan small windows around candidate physical addresses.
 
-    Uses ProcessPoolExecutor for true CPU parallelism.  Falls back to
-    ThreadPoolExecutor if process spawning fails.
+    Uses ProcessPoolExecutor with byte-incremented patterns (same
+    anti-ghost technique as scan_memory).  Falls back to ThreadPoolExecutor.
+    If *_inc_patterns* is provided, uses them directly.
     """
     if isinstance(patterns, bytes):
         patterns = [patterns]
@@ -1329,6 +1699,23 @@ def scan_memory_windows(inpout, patterns, centers, window_mb=512,
     if max_centers is not None and max_centers > 0:
         centers = centers[:max_centers]
 
+    ram_ranges = get_physical_ram_ranges()
+    if ram_ranges is not None:
+        mmio_hole = _find_mmio_hole(ram_ranges)
+        range_strs = [
+            f"0x{s:09X}-0x{e:09X} ({(e - s + 1) / (1024 ** 3):.1f} GB)"
+            for s, e in ram_ranges
+        ]
+        map_line = f"Physical RAM map: {', '.join(range_strs)}"
+        _elog(map_line)
+        cb(0, map_line)
+    else:
+        mmio_hole = _FALLBACK_MMIO_HOLE
+        fallback_msg = ("Physical RAM map: unavailable, using hardcoded "
+                        "MMIO exclusion (0xC0000000-0xFFFFFFFF)")
+        _elog(fallback_msg)
+        cb(0, fallback_msg)
+
     half = (window_mb * 1024 * 1024) // 2
     chunks = set()
     for c in centers:
@@ -1336,7 +1723,7 @@ def scan_memory_windows(inpout, patterns, centers, window_mb=512,
         end = c + half
         phys = (start // CHUNK_SIZE) * CHUNK_SIZE
         while phys < end:
-            if not (0xC0000000 <= phys < 0x100000000):
+            if _is_scannable(phys, mmio_hole):
                 chunks.add(phys)
             phys += CHUNK_SIZE
 
@@ -1345,6 +1732,12 @@ def scan_memory_windows(inpout, patterns, centers, window_mb=512,
 
     chunk_list = sorted(chunks)
     total = len(chunk_list)
+    scannable_gb = total * CHUNK_SIZE / (1024 ** 3)
+    win_msg = (f"Window scan: {len(centers)} center(s), "
+               f"{window_mb} MB window, "
+               f"{scannable_gb:.2f} GB scannable in {total} chunk(s)")
+    _elog(win_msg)
+    cb(0, win_msg)
 
     if num_threads and num_threads > 0:
         num_workers = num_threads
@@ -1356,6 +1749,7 @@ def scan_memory_windows(inpout, patterns, centers, window_mb=512,
     ranges = [r for r in ranges if r]
 
     t0 = time.perf_counter()
+    inc_patterns = _inc_patterns or [p.translate(_INC_TABLE) for p in patterns]
 
     try:
         dll_path = inpout._dll._name
@@ -1367,7 +1761,7 @@ def scan_memory_windows(inpout, patterns, centers, window_mb=512,
             initializer=_mp_init_worker,
             initargs=(dll_path, shared_progress),
         ) as pool:
-            futures = [pool.submit(_mp_scan_range_windows, r, patterns)
+            futures = [pool.submit(_mp_scan_range_windows, r, inc_patterns)
                        for r in ranges]
 
             while not all(f.done() for f in futures):
@@ -1401,13 +1795,14 @@ def scan_memory_windows(inpout, patterns, centers, window_mb=512,
                     buf = (ctypes.c_ubyte * CHUNK_SIZE)()
                     ctypes.memmove(buf, virt, CHUNK_SIZE)
                     data = bytes(buf)
-                    for pattern in patterns:
+                    inc_data = data.translate(_INC_TABLE)
+                    for pi, inc_pat in enumerate(inc_patterns):
                         pos = 0
                         while True:
-                            idx = data.find(pattern, pos)
+                            idx = inc_data.find(inc_pat, pos)
                             if idx < 0:
                                 break
-                            local.append((phys_base + idx, pattern))
+                            local.append((phys_base + idx, pi))
                             pos = idx + 2
                 finally:
                     inpout.unmap_phys(virt, handle)
@@ -1432,6 +1827,8 @@ def scan_memory_windows(inpout, patterns, centers, window_mb=512,
             futures = [pool.submit(_scan_range, r) for r in ranges]
             for fut in as_completed(futures):
                 found.extend(fut.result())
+
+    found = [(addr, patterns[pi]) for addr, pi in found]
 
     seen = set()
     deduped = []
@@ -2286,6 +2683,167 @@ def get_dpm_ranges(smu):
     return results
 
 
+_OFFSET_SCAN_WINDOW = 64 * 1024 * 1024   # 64 MB default mapping window
+
+
+def _offset_scan_chunk_list(chunk_indices, page_offset, fingerprint):
+    """Scan a contiguous slice of chunk indices (worker entry point).
+
+    Uses the per-process globals ``_mp_inpout`` and ``_mp_progress``
+    set by ``_mp_init_worker``.
+    """
+    inpout = _mp_inpout
+    prog = _mp_progress
+    fp_len = len(fingerprint)
+    fp_head = fingerprint[0:1]
+    ci_set = set(chunk_indices)
+    matches = []
+    ci_pos = 0
+    total = len(chunk_indices)
+
+    while ci_pos < total:
+        ci = chunk_indices[ci_pos]
+        phys_base = ci * CHUNK_SIZE
+
+        max_cw = _OFFSET_SCAN_WINDOW // CHUNK_SIZE
+        cw = min(max_cw, total - ci_pos)
+        actual = 1
+        for k in range(1, cw):
+            if (ci + k) in ci_set:
+                actual = k + 1
+            else:
+                break
+        cw = actual
+        window = cw * CHUNK_SIZE
+
+        virt = handle = None
+        while window >= CHUNK_SIZE:
+            try:
+                virt, handle = inpout.map_phys(phys_base, window)
+                break
+            except (IOError, OSError):
+                window //= 2
+                cw = window // CHUNK_SIZE
+
+        if virt is None:
+            ci_pos += 1
+            if prog is not None:
+                with prog.get_lock():
+                    prog.value += 1
+            continue
+
+        try:
+            arr = (ctypes.c_ubyte * window).from_address(virt)
+            mv = memoryview(arr)
+            probe = bytes(mv[page_offset::4096])
+            pos = -1
+            while True:
+                pos = probe.find(fp_head, pos + 1)
+                if pos == -1:
+                    break
+                off = pos * 4096 + page_offset
+                if ctypes.string_at(virt + off, fp_len) == fingerprint:
+                    matches.append(phys_base + off)
+        finally:
+            inpout.unmap_phys(virt, handle)
+
+        ci_pos += cw
+        if prog is not None:
+            with prog.get_lock():
+                prog.value += cw
+
+    return matches
+
+
+def _offset_scan(inpout, fingerprint, page_offset, max_gb=0,
+                 progress_callback=None):
+    """Fast parallel scan checking one page offset per 4KB page.
+
+    Splits the scannable address range across multiple worker
+    processes (one per CPU core, capped at 8).  Each worker maps
+    large 64 MB windows, uses a strided memoryview to extract one
+    probe byte per page in C, then bytes.find() to locate
+    candidates.  Falls back to single-threaded on frozen builds
+    or when ProcessPoolExecutor fails.
+
+    Returns list of physical addresses where fingerprint matches.
+    """
+    cb = progress_callback or _noop_cb
+    fp_len = len(fingerprint)
+
+    ram_ranges = get_physical_ram_ranges()
+    chunk_indices = _build_scannable_chunks(max_gb, ram_ranges)
+    total_chunks = len(chunk_indices)
+
+    if page_offset + fp_len > 4096:
+        cb(100, "Offset scan: page_offset + fingerprint exceeds page size")
+        return []
+
+    t0 = time.perf_counter()
+    num_workers = min(os.cpu_count() or 4, 8, max(1, total_chunks // 32))
+
+    if num_workers < 2:
+        global _mp_inpout, _mp_progress
+        saved_inp, _mp_inpout = _mp_inpout, inpout
+        saved_prog, _mp_progress = _mp_progress, None
+        try:
+            matches = _offset_scan_chunk_list(
+                chunk_indices, page_offset, fingerprint)
+        finally:
+            _mp_inpout = saved_inp
+            _mp_progress = saved_prog
+    else:
+        per_worker = (total_chunks + num_workers - 1) // num_workers
+        slices = [chunk_indices[i * per_worker:(i + 1) * per_worker]
+                  for i in range(num_workers)]
+        slices = [s for s in slices if s]
+
+        matches = []
+        try:
+            dll_path = inpout._dll._name
+            shared_progress = mp.Value('i', 0)
+
+            with ProcessPoolExecutor(
+                max_workers=len(slices),
+                initializer=_mp_init_worker,
+                initargs=(dll_path, shared_progress),
+            ) as pool:
+                futures = [
+                    pool.submit(_offset_scan_chunk_list, s,
+                                page_offset, fingerprint)
+                    for s in slices
+                ]
+                while not all(f.done() for f in futures):
+                    done = shared_progress.value
+                    if done > 0:
+                        pct = done / total_chunks * 100
+                        gb = done * CHUNK_SIZE / (1024 ** 3)
+                        cb(pct, f"Offset scan: {pct:.0f}% ({gb:.1f} GB)")
+                    time.sleep(0.10)
+
+                for fut in futures:
+                    matches.extend(fut.result())
+        except Exception as exc:
+            _elog(f"_offset_scan: ProcessPool failed ({exc}), "
+                  f"falling back to single-process")
+            saved_inp, _mp_inpout = _mp_inpout, inpout
+            saved_prog, _mp_progress = _mp_progress, None
+            try:
+                matches = _offset_scan_chunk_list(
+                    chunk_indices, page_offset, fingerprint)
+            finally:
+                _mp_inpout = saved_inp
+                _mp_progress = saved_prog
+
+    elapsed = time.perf_counter() - t0
+    total_gb = total_chunks * CHUNK_SIZE / (1024 ** 3)
+    cb(100, f"Offset scan done: {len(matches)} match(es) in {elapsed:.1f}s "
+       f"[{total_gb:.1f} GB, offset 0x{page_offset:03X}]")
+    _elog(f"_offset_scan: {len(matches)} match(es) in {elapsed:.1f}s "
+          f"({total_gb:.1f} GB, offset 0x{page_offset:03X})")
+    return matches
+
+
 def scan_for_pptable(inpout, settings, scan_opts=None, progress_callback=None,
                      vbios_values=None):
     """Scan physical memory for the driver's cached PPTable.
@@ -2317,17 +2875,33 @@ def scan_for_pptable(inpout, settings, scan_opts=None, progress_callback=None,
 
     # Decide scan strategy: fingerprint (preferred) vs legacy clock pattern
     use_fingerprint = (vbios_values is not None
-                       and vbios_values.pp_fingerprint
-                       and vbios_values.fingerprint_to_clocks > 0)
+                       and (vbios_values.pp_inner_fingerprint
+                            or (vbios_values.pp_fingerprint
+                                and vbios_values.fingerprint_to_clocks > 0)))
 
     if use_fingerprint:
-        fingerprint = vbios_values.pp_fingerprint
-        fp_to_clk = vbios_values.fingerprint_to_clocks
-        search_patterns = [fingerprint]
-        cb(5, f"Using immutable PP table fingerprint ({len(fingerprint)} bytes, "
-              f"clocks at +{fp_to_clk})")
-        cb(10, f"Fingerprint: {fingerprint[:20].hex(' ').upper()}"
-               f"{'...' if len(fingerprint) > 20 else ''}")
+        # The driver copies only the inner smc_pptable (PPTable_t) into its
+        # kernel cache, stripping the outer smu_14_0_2_powerplay_table wrapper.
+        # The outer fingerprint (golden_pp_id..thermal_controller_type) only
+        # exists in full VBIOS ROM copies (e.g. our own Python process heap).
+        # Prefer the inner fingerprint (MsgLimits/Power) which matches the
+        # driver's actual kernel cache.
+        inner_fp = vbios_values.pp_inner_fingerprint
+        if inner_fp:
+            search_patterns = [inner_fp]
+            fp_to_clk_list = [vbios_values.inner_fp_to_clocks]
+            cb(5, f"Using inner PP table fingerprint ({len(inner_fp)}B, "
+                  f"clocks at {vbios_values.inner_fp_to_clocks})")
+            cb(10, f"Inner FP: {inner_fp.hex(' ').upper()}")
+        else:
+            fingerprint = vbios_values.pp_fingerprint
+            fp_to_clk = vbios_values.fingerprint_to_clocks
+            search_patterns = [fingerprint]
+            fp_to_clk_list = [fp_to_clk]
+            cb(5, f"Using outer PP table fingerprint ({len(fingerprint)}B, "
+                  f"clocks at +{fp_to_clk})")
+            cb(10, f"Outer FP: {fingerprint[:20].hex(' ').upper()}"
+                   f"{'...' if len(fingerprint) > 20 else ''}")
         cb(12, f"VBIOS power: PPT={vbios_values.power_ac}W "
                f"TDC_GFX={vbios_values.tdc_gfx}A TDC_SOC={vbios_values.tdc_soc}A")
     else:
@@ -2349,13 +2923,131 @@ def scan_for_pptable(inpout, settings, scan_opts=None, progress_callback=None,
         cb(15, f"Search pattern (original): {clock_pattern.hex(' ').upper()}")
         cb(20, f"Search pattern (patched):  {patched_clock_pattern.hex(' ').upper()}")
 
-    # --- Full physical memory scan ---
-    cb(30, "Starting full physical memory scan...")
-    raw_results = scan_memory(
-        inpout, search_patterns, scan_opts.max_gb,
-        num_threads=scan_opts.num_threads,
-        progress_callback=_map_progress(cb, 30, 90),
-    )
+    # ------------------------------------------------------------------
+    # FAST PATH: offset-targeted scan at the known PPTable page offset.
+    # Always tried first when a fingerprint is available.  Falls back to
+    # the full byte-search scan only when no valid match is found.
+    # ------------------------------------------------------------------
+    _PPTABLE_PAGE_OFFSET = 0xF74
+    _fp_offset = fp_to_clk_list[0] if use_fingerprint else 0
+    _active_fp = (search_patterns[0] if (use_fingerprint and search_patterns)
+                  else None)
+
+    if use_fingerprint and _active_fp:
+        fp_page_offset = (_PPTABLE_PAGE_OFFSET - _fp_offset) & 0xFFF
+        cb(15, f"Offset scan: clock offset 0x{_PPTABLE_PAGE_OFFSET:03X}, "
+              f"fingerprint offset 0x{fp_page_offset:03X}")
+        cb(20, "Starting offset-targeted scan...")
+        raw_addrs = _offset_scan(
+            inpout, _active_fp, fp_page_offset,
+            max_gb=scan_opts.max_gb,
+            progress_callback=_map_progress(cb, 20, 85),
+        )
+        if raw_addrs:
+            clock_addrs = [a + _fp_offset for a in raw_addrs]
+            valid_addrs = []
+            rejected_addrs = []
+            match_details = []
+            already_patched = []
+            target_game = settings._game_clock()
+            target_boost = settings._boost_clock()
+            orig_game = vbios_values.gameclock_ac
+
+            for addr in clock_addrs:
+                ml_addr = addr + 28
+                try:
+                    ml = read_msglimits(inpout, ml_addr)
+                except (IOError, OSError):
+                    rejected_addrs.append(addr)
+                    match_details.append({
+                        'addr': addr, 'valid': False, 'already_patched': False,
+                        'game_clock': 0, 'boost_clock': 0, 'msglimits': {},
+                        'reject_reasons': ["Unreadable"],
+                    })
+                    continue
+
+                page_base = addr & ~0xFFF
+                page_off = addr - page_base
+                v, h = inpout.map_phys(page_base, 4096)
+                game_val = ctypes.c_ushort.from_address(v + page_off + 2).value
+                boost_val = ctypes.c_ushort.from_address(v + page_off + 4).value
+                inpout.unmap_phys(v, h)
+
+                valid, reasons = is_valid_pptable(ml)
+                if valid and vbios_values is not None:
+                    ppt = ml['ppt0_ac']
+                    exp_ppt = vbios_values.power_ac
+                    ppt_lo, ppt_hi = int(exp_ppt * 0.5), int(exp_ppt * 1.5)
+                    if not (ppt_lo <= ppt <= ppt_hi):
+                        valid = False
+                        reasons.append(
+                            f"PPT={ppt}W outside VBIOS±50% [{ppt_lo}-{ppt_hi}]")
+
+                is_patched = (game_val == target_game and boost_val == target_boost
+                              and game_val != orig_game)
+                if is_patched:
+                    already_patched.append(addr)
+
+                if valid:
+                    valid_addrs.append(addr)
+                else:
+                    rejected_addrs.append(addr)
+                match_details.append({
+                    'addr': addr, 'valid': valid,
+                    'already_patched': is_patched,
+                    'game_clock': game_val, 'boost_clock': boost_val,
+                    'msglimits': ml, 'reject_reasons': reasons,
+                })
+
+            if valid_addrs:
+                cb(100, f"Offset scan: {len(valid_addrs)} valid PPTable(s) "
+                   f"at offset 0x{_PPTABLE_PAGE_OFFSET:03X}")
+                return ScanResult(
+                    valid_addrs=valid_addrs,
+                    already_patched_addrs=[a for a in already_patched
+                                           if a in valid_addrs],
+                    rejected_addrs=rejected_addrs,
+                    all_clock_addrs=clock_addrs,
+                    did_full_scan=True,
+                    match_details=match_details,
+                    fingerprint_validated=True,
+                )
+        cb(88, "Offset scan: no valid match — falling back to full scan")
+        _elog("_offset_scan: fallback to full scan")
+
+    # ------------------------------------------------------------------
+    # FULL SCAN: byte-search across all physical memory
+    # ------------------------------------------------------------------
+    if use_fingerprint:
+        inc_patterns = [p.translate(_INC_TABLE) for p in search_patterns]
+        _saved_inner_inc = vbios_values.pp_inner_fingerprint.translate(_INC_TABLE)
+        _saved_outer_inc = (vbios_values.pp_fingerprint.translate(_INC_TABLE)
+                            if vbios_values.pp_fingerprint else b'')
+        vbios_values.pp_inner_fingerprint = b''
+        vbios_values.pp_fingerprint = b''
+        search_patterns.clear()
+        inner_fp = None
+        gc.collect()
+
+        cb(30, "Starting full physical memory scan (heap scrubbed)...")
+        raw_results = scan_memory(
+            inpout, [b'\x00'], scan_opts.max_gb,
+            num_threads=scan_opts.num_threads,
+            progress_callback=_map_progress(cb, 30, 90),
+            _inc_patterns=inc_patterns,
+        )
+
+        vbios_values.pp_inner_fingerprint = _saved_inner_inc.translate(_DEC_TABLE)
+        vbios_values.pp_fingerprint = (
+            _saved_outer_inc.translate(_DEC_TABLE) if _saved_outer_inc else b'')
+        del _saved_inner_inc, _saved_outer_inc
+    else:
+        cb(30, "Starting full physical memory scan...")
+        raw_results = scan_memory(
+            inpout, search_patterns, scan_opts.max_gb,
+            num_threads=scan_opts.num_threads,
+            progress_callback=_map_progress(cb, 30, 90),
+        )
     did_full_scan = True
 
     if not raw_results:
@@ -2364,10 +3056,13 @@ def scan_for_pptable(inpout, settings, scan_opts=None, progress_callback=None,
         return ScanResult([], [], [], [], did_full_scan, [],
                           error=f"PPTable {label} not found in memory")
 
-    # Convert to clock-block addresses (fingerprint matches at header, not clocks)
-    clock_results = [(addr + fp_to_clk, pat) for addr, pat in raw_results]
+    _elog(f"scan_for_pptable: {len(raw_results)} raw matches")
 
-    # --- Determine already-patched status ---
+    if use_fingerprint:
+        clock_results = [(addr + _fp_offset, pat) for addr, pat in raw_results]
+    else:
+        clock_results = [(addr + fp_to_clk, pat) for addr, pat in raw_results]
+
     target_game = settings._game_clock()
     target_boost = settings._boost_clock()
     orig_game = vbios_values.gameclock_ac if vbios_values else ORIG_GAMECLOCK_AC
@@ -2387,7 +3082,6 @@ def scan_for_pptable(inpout, settings, scan_opts=None, progress_callback=None,
         already_patched = [addr for addr, pat in clock_results
                            if pat == patched_clock_pattern]
 
-    # --- Validation loop ---
     clock_addrs = [addr for addr, pat in clock_results]
     msglimits_addrs = [a + 28 for a in clock_addrs]
 
@@ -2398,8 +3092,17 @@ def scan_for_pptable(inpout, settings, scan_opts=None, progress_callback=None,
     cb(90, f"Validating {len(clock_addrs)} match(es)...")
 
     for i, addr in enumerate(clock_addrs):
-        ml = read_msglimits(inpout, msglimits_addrs[i])
         is_patched = addr in already_patched
+        try:
+            ml = read_msglimits(inpout, msglimits_addrs[i])
+        except (IOError, OSError):
+            rejected_addrs.append(addr)
+            match_details.append({
+                'addr': addr, 'valid': False, 'already_patched': is_patched,
+                'game_clock': 0, 'boost_clock': 0, 'msglimits': {},
+                'reject_reasons': ["Unreadable physical page"],
+            })
+            continue
 
         page_base = addr & ~0xFFF
         page_off = addr - page_base
@@ -2409,6 +3112,17 @@ def scan_for_pptable(inpout, settings, scan_opts=None, progress_callback=None,
         inpout.unmap_phys(v, h)
 
         valid, reasons = is_valid_pptable(ml)
+
+        if valid and vbios_values is not None:
+            ppt = ml['ppt0_ac']
+            exp_ppt = vbios_values.power_ac
+            ppt_lo, ppt_hi = int(exp_ppt * 0.5), int(exp_ppt * 1.5)
+            if not (ppt_lo <= ppt <= ppt_hi):
+                valid = False
+                reasons.append(
+                    f"PPT={ppt}W outside VBIOS±50% [{ppt_lo}-{ppt_hi}]"
+                )
+
         if valid:
             valid_addrs.append(addr)
         else:
@@ -2431,11 +3145,7 @@ def scan_for_pptable(inpout, settings, scan_opts=None, progress_callback=None,
                           error="All matches were false positives",
                           fingerprint_validated=use_fingerprint)
 
-    # --- Page-offset consensus filter ---
-    # Real driver cache copies share the same page offset because the driver
-    # allocates them identically.  Ghost hits (from our own Python heap) land
-    # on random page offsets.  Group by low-12-bit offset and keep the
-    # largest group.
+    # Page-offset consensus filter (full scan only)
     if len(valid_addrs) >= 2:
         offsets = Counter(a & 0xFFF for a in valid_addrs)
         dominant_offset, dominant_count = offsets.most_common(1)[0]
@@ -2454,11 +3164,8 @@ def scan_for_pptable(inpout, settings, scan_opts=None, progress_callback=None,
                             ]
                 valid_addrs = [a for a in valid_addrs if (a & 0xFFF) == dominant_offset]
 
-    # --- Stability re-read ---
-    # Re-read after a short delay and reject addresses whose data shifted
-    # (indicates a Python heap object, not driver cache).
+    # Stability re-read (full scan only — workers may leave stale pages)
     if valid_addrs:
-        # Snapshot initial clock values for each address
         initial_clocks = {}
         for addr in valid_addrs:
             try:
@@ -2468,7 +3175,7 @@ def scan_for_pptable(inpout, settings, scan_opts=None, progress_callback=None,
             except (IOError, OSError):
                 pass
 
-        time.sleep(0.05)
+        time.sleep(0.5)
         stable_addrs = []
         for addr in valid_addrs:
             try:
@@ -2477,7 +3184,6 @@ def scan_for_pptable(inpout, settings, scan_opts=None, progress_callback=None,
                     rejected_addrs.append(addr)
                     continue
                 if use_fingerprint:
-                    # Fingerprint mode: accept if values are stable between reads
                     prev = initial_clocks.get(addr)
                     if prev and (clk['gameclock_ac'], clk['boostclock_ac']) == prev:
                         stable_addrs.append(addr)
@@ -2485,7 +3191,6 @@ def scan_for_pptable(inpout, settings, scan_opts=None, progress_callback=None,
                         cb(95, f"Stability check: 0x{addr:012X} drifted, rejecting")
                         rejected_addrs.append(addr)
                 else:
-                    # Legacy mode: check against expected original/patched values
                     expected_game = settings._game_clock() if addr in already_patched else orig_game
                     expected_boost = settings._boost_clock() if addr in already_patched else orig_boost
                     if (clk['gameclock_ac'] in (expected_game, settings._game_clock()) and
@@ -2498,6 +3203,18 @@ def scan_for_pptable(inpout, settings, scan_opts=None, progress_callback=None,
             except (IOError, OSError):
                 rejected_addrs.append(addr)
         valid_addrs = stable_addrs
+
+    # Deep probe (full scan only — offset scan targets known-good layout)
+    if valid_addrs:
+        probed = []
+        for addr in valid_addrs:
+            if probe_phys_readable(inpout, addr, _DEEP_PROBE_SIZE):
+                probed.append(addr)
+            else:
+                cb(98, f"Deep probe: 0x{addr:012X} unreadable at depth "
+                       f"{_DEEP_PROBE_SIZE} — rejecting")
+                rejected_addrs.append(addr)
+        valid_addrs = probed
 
     cb(100, f"Found {len(valid_addrs)} valid PPTable(s), "
        f"{len(rejected_addrs)} rejected"
@@ -2579,7 +3296,7 @@ def scan_for_od_table(inpout, pattern, pptable_addrs=None, scan_opts=None,
         cb(50, "Full physical memory scan for OD pattern...")
         all_matches = scan_memory(
             inpout, [pattern],
-            max_gb=min(2, scan_opts.max_gb),  # Limit OD scan to 2 GB initially
+            max_gb=scan_opts.max_gb,
             num_threads=scan_opts.num_threads,
             progress_callback=_map_progress(cb, 50, 95),
         )
@@ -2774,7 +3491,11 @@ def patch_pptable(inpout, scan_result, settings, scan_opts=None,
 
 def apply_clocks_only(inpout, smu, scan_result, settings, vbios_values=None,
                       progress_callback=None):
-    """Patch PPTable clocks in RAM, then DisallowGfxOff + workload mask cycle.
+    """Patch PPTable clocks in RAM, set SMU freq limits, then workload cycle.
+
+    After patching GameClockAc/BoostClockAc in physical RAM, sends
+    SetSoftMax/HardMax/SoftMin/HardMin frequency commands to the SMU so
+    the firmware enforces the new clock range immediately.
 
     Validates via MsgLimits PPT values (stable between VBIOS and RAM, unlike
     clocks which the driver adjusts via silicon binning).
@@ -2804,7 +3525,24 @@ def apply_clocks_only(inpout, smu, scan_result, settings, vbios_values=None,
             patch_u16(inpout, addr, 2, target_game)
             patch_u16(inpout, addr, 4, target_boost)
             results['patched_count'] += 1
+    min_clock = settings.effective_min_clock
+    effective_max = settings.effective_max
+    param_max = ((PPCLK.GFXCLK & 0xFFFF) << 16) | (effective_max & 0xFFFF)
+    param_min = ((PPCLK.GFXCLK & 0xFFFF) << 16) | (min_clock & 0xFFFF)
+    resp, _ = smu.send_msg(PPSMC.SetSoftMaxByFreq, param_max)
+    results['soft_max'] = resp
+    resp, _ = smu.send_msg(PPSMC.SetHardMaxByFreq, param_max)
+    results['hard_max'] = resp
+    resp, _ = smu.send_msg(PPSMC.SetSoftMinByFreq, param_min)
+    results['soft_min'] = resp
+    resp, _ = smu.send_msg(PPSMC.SetHardMinByFreq, param_min)
+    results['hard_min'] = resp
     smu.send_msg(PPSMC.DisallowGfxOff)
+    if settings.effective_lock_features:
+        feat_mask = ((1 << SMU_FEATURE.DS_GFXCLK) |
+                     (1 << SMU_FEATURE.GFX_ULV) |
+                     (1 << SMU_FEATURE.GFXOFF))
+        smu.send_msg(PPSMC.DisableSmuFeaturesLow, feat_mask)
     smu.send_msg(PPSMC.SetWorkloadMask, 1 << 2)
     time.sleep(0.3)
     smu.send_msg(PPSMC.SetWorkloadMask, 1 << 1)

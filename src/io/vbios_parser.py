@@ -107,12 +107,14 @@ class VbiosValues:
     fingerprint_to_clocks: int = 0   # byte offset from fingerprint match -> BaseClockAc
     baseclock_pp_offset: int = 0     # absolute byte offset of BaseClockAc within PP table
 
-    # Inner PPTable_t fingerprint for DMA buffer (VRAM) scanning.
-    # The DMA buffer contains only the inner PPTable_t (smc_pptable),
-    # NOT the outer wrapper.  Extracted from DriverReportedClocks deep
-    # within SkuTable — safely past the metrics overwrite zone.
+    # Inner PPTable_t fingerprint for DMA buffer (VRAM) AND system-RAM scanning.
+    # The driver copies only the inner smc_pptable (PPTable_t) into its kernel
+    # cache, stripping the outer smu_14_0_2_powerplay_table wrapper.
+    # Extracted from MsgLimits/Power — board-level power limits that the driver
+    # does not modify.
     pp_inner_fingerprint: bytes = b''
     pp_inner_fp_dma_offset: int = 0   # offset of inner fingerprint within DMA buffer
+    inner_fp_to_clocks: int = 0       # byte offset from inner fingerprint match -> BaseClockAc
 
     def clock_pattern(self) -> bytes:
         return struct.pack("<3H", self.baseclock_ac, self.gameclock_ac, self.boostclock_ac)
@@ -273,6 +275,7 @@ def _parse_vbios_upp_bytes(
         _INNER_FP_LEN = 16
         pp_inner_fp = b''
         inner_fp_dma_off = 0
+        inner_fp_to_clk = 0
         try:
             pfe_ver = _get_info("smc_pptable/PFE_Settings/Version")
             pwr_info = _get_info("smc_pptable/SkuTable/MsgLimits/Power/0/0")
@@ -280,6 +283,7 @@ def _parse_vbios_upp_bytes(
                 smc_off = pfe_ver["offset"]
                 pwr_off = pwr_info["offset"]
                 inner_fp_dma_off = pwr_off - smc_off
+                inner_fp_to_clk = bc_pp_off - pwr_off
                 if pwr_off + _INNER_FP_LEN <= len(pp_tbl):
                     pp_inner_fp = bytes(pp_tbl[pwr_off:pwr_off + _INNER_FP_LEN])
         except Exception:
@@ -321,6 +325,7 @@ def _parse_vbios_upp_bytes(
             baseclock_pp_offset=bc_pp_off,
             pp_inner_fingerprint=pp_inner_fp,
             pp_inner_fp_dma_offset=inner_fp_dma_off,
+            inner_fp_to_clocks=inner_fp_to_clk,
         )
     except Exception:
         return None

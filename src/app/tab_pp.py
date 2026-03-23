@@ -75,6 +75,7 @@ class PPTab(QWidget):
 
         rom_bytes, _ = read_vbios_decoded(DEFAULT_VBIOS_PATH)
         decoded = decode_pp_table_full(rom_bytes, rom_path=DEFAULT_VBIOS_PATH) if rom_bytes else None
+        del rom_bytes
         self._decoded = decoded
         decoded_tree = decoded.data if decoded else None
 
@@ -266,6 +267,17 @@ class PPTab(QWidget):
         pp_scroll.setWidgetResizable(True)
         pp_scroll.setWidget(pp_grp)
         pp_tab_layout.addWidget(pp_scroll)
+
+        # Zero the inner fingerprint region in pp_bytes so physical memory
+        # scans don't match our own heap copy of the decoded PP table.
+        if decoded is not None:
+            _bc_off = getattr(self.vbios_values, 'baseclock_pp_offset', 0)
+            _fp_to_clk = getattr(self.vbios_values, 'inner_fp_to_clocks', 0)
+            if _bc_off > 0 and _fp_to_clk > 0:
+                _fp_start = _bc_off - _fp_to_clk
+                _fp_end = _fp_start + 16
+                if 0 <= _fp_start < _fp_end <= len(decoded.pp_bytes):
+                    decoded.pp_bytes[_fp_start:_fp_end] = b'\x00' * 16
 
     # ------------------------------------------------------------------
 
