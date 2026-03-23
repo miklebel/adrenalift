@@ -55,13 +55,13 @@ python -m PyInstaller --noconfirm build.spec
 
 ### Reporting Bugs
 
-- Use the [Bug Report](https://github.com/miklebel/adrenalift/issues/new?template=bug_report.yml) issue template.
+- Use the **Bug Report** template when [opening a new issue](https://github.com/miklebel/adrenalift/issues/new/choose).
 - Include your GPU model, driver version, Windows version, and Adrenalift version.
-- Attach relevant log output if possible.
+- Attach the `overclock_log.txt` file from the folder where the executable is located.
 
 ### Suggesting Features
 
-- Use the [Feature Request](https://github.com/miklebel/adrenalift/issues/new?template=feature_request.yml) issue template.
+- Use the **Feature Request** template when [opening a new issue](https://github.com/miklebel/adrenalift/issues/new/choose).
 - Describe the use case, not just the solution.
 
 ### Pull Requests
