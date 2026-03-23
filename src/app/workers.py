@@ -1,5 +1,5 @@
 """
-Background worker threads for the RDNA4 Overclock GUI.
+Background worker threads for Adrenalift.
 
 Each worker runs a blocking hardware operation on a QThread so the
 UI stays responsive.
@@ -7,7 +7,6 @@ UI stays responsive.
 
 from __future__ import annotations
 
-import gzip
 import json
 import logging
 import os
@@ -21,23 +20,27 @@ from src.engine.overclock_engine import (
     OverclockSettings,
     ScanOptions,
     ScanResult,
+    _set_inmemory_dma,
     cleanup_hardware,
-    detect_bar_size,
     init_hardware,
     is_valid_pptable,
     query_smu_state,
-    read_buf,
     read_metrics,
     read_od,
     read_pptable_at_addr,
     read_smu_metrics_full,
     read_smu_table_raw,
     read_u16,
-    read_vram_start,
     scan_for_pptable,
     vram_scan_for_dma,
+    read_pfe_settings,
+    patch_features_to_run,
+    patch_debug_overrides,
+    patch_features_tools_path,
+    patch_debug_tools_path,
+    check_od_mem_timing_caps,
+    decode_debug_overrides,
 )
-from src.engine.od_table import TABLE_SMU_METRICS
 from src.io.vbios_parser import parse_vbios_or_defaults
 
 # ---------------------------------------------------------------------------
@@ -85,12 +88,12 @@ class ApplyWorker(QThread):
         hw = None
         _log_to_file(f"ApplyWorker[{self.action_name}]: starting")
         try:
-            hw = init_hardware()
+            hw = init_hardware(skip_dma_discovery=True)
             _log_to_file(f"ApplyWorker[{self.action_name}]: hardware initialized, "
                          f"dma_path={hw['dma_path']}")
             result = self.apply_fn(hw)
             if isinstance(result, tuple) and len(result) == 2 and result[0] is False:
-                err = result[1]  # e.g. OD reject: (False, "Unsupported feature")
+                err = result[1]
                 _log_to_file(f"ApplyWorker[{self.action_name}]: apply_fn reported failure: {err}")
             else:
                 _log_to_file(f"ApplyWorker[{self.action_name}]: apply_fn completed OK")
@@ -104,6 +107,26 @@ class ApplyWorker(QThread):
                 except Exception:
                     _log_exception_to_file(f"ApplyWorker[{self.action_name}] cleanup")
         self.finished_signal.emit(self.action_name, err)
+
+
+class EscapeWorker(QThread):
+    """Background worker for D3DKMTEscape operations (no admin/hardware needed)."""
+    result_signal = Signal(str, object)  # (action_name, result_dict)
+
+    def __init__(self, action_name: str, fn, parent=None):
+        super().__init__(parent)
+        self.action_name = action_name
+        self.fn = fn
+
+    def run(self):
+        _log_to_file(f"EscapeWorker[{self.action_name}]: starting")
+        try:
+            result = self.fn()
+            _log_to_file(f"EscapeWorker[{self.action_name}]: completed OK")
+            self.result_signal.emit(self.action_name, result)
+        except Exception as e:
+            _log_exception_to_file(f"EscapeWorker[{self.action_name}]")
+            self.result_signal.emit(self.action_name, {"error": str(e)})
 
 
 class RegistryPatchWorker(QThread):
@@ -149,7 +172,7 @@ class MemoryRefreshWorker(QThread):
         hw = None
         _log_to_file(f"MemoryRefreshWorker: starting ({len(self.valid_addrs)} addrs)")
         try:
-            hw = init_hardware()
+            hw = init_hardware(skip_dma_discovery=True)
             _log_to_file(f"MemoryRefreshWorker: init OK, dma_path={hw['dma_path']}")
             inpout = hw["inpout"]
         except Exception:
@@ -194,8 +217,11 @@ class MetricsRefreshWorker(QThread):
     def run(self):
         hw = None
         try:
-            hw = init_hardware()
+            hw = init_hardware(skip_dma_discovery=True)
             _log_to_file(f"MetricsRefreshWorker: init OK, dma_path={hw['dma_path']}")
+            if hw.get("virt") is None:
+                self.results_signal.emit({"error": "DMA buffer not available — run DRAM Scan first"})
+                return
             _m, d = read_smu_metrics_full(hw["smu"], hw["virt"])
             if d:
                 self.results_signal.emit(d)
@@ -226,8 +252,12 @@ class SmuTableReadWorker(QThread):
     def run(self):
         hw = None
         try:
-            hw = init_hardware()
+            hw = init_hardware(skip_dma_discovery=True)
             _log_to_file(f"SmuTableReadWorker: init OK, dma_path={hw['dma_path']}")
+            if hw.get("virt") is None:
+                self.results_signal.emit(
+                    self.table_name, {"error": "DMA buffer not available — run DRAM Scan first"})
+                return
             resp, raw = read_smu_table_raw(
                 hw["smu"], hw["virt"], self.table_id, self.read_size
             )
@@ -267,11 +297,12 @@ class DetailedRefreshWorker(QThread):
         hw = None
         _log_to_file("DetailedRefreshWorker: starting")
         try:
-            hw = init_hardware(gui_log=self.log_signal.emit)
+            hw = init_hardware(gui_log=self.log_signal.emit, skip_dma_discovery=True)
             _log_to_file(f"DetailedRefreshWorker: init OK, dma_path={hw['dma_path']}")
             inpout = hw["inpout"]
             smu = hw["smu"]
             virt = hw["virt"]
+            dma_ok = virt is not None
 
             if self.valid_addrs:
                 try:
@@ -296,17 +327,20 @@ class DetailedRefreshWorker(QThread):
                         except Exception:
                             continue
 
-            try:
-                od_table = read_od(smu, virt)
-                _log_to_file(f"DetailedRefreshWorker: read_od={'OK' if od_table else 'None'}")
-            except Exception:
-                _log_exception_to_file("DetailedRefreshWorker read_od")
+            if dma_ok:
+                try:
+                    od_table = read_od(smu, virt)
+                    _log_to_file(f"DetailedRefreshWorker: read_od={'OK' if od_table else 'None'}")
+                except Exception:
+                    _log_exception_to_file("DetailedRefreshWorker read_od")
 
-            try:
-                metrics = read_metrics(smu, virt)
-                _log_to_file(f"DetailedRefreshWorker: read_metrics={metrics}")
-            except Exception:
-                _log_exception_to_file("DetailedRefreshWorker read_metrics")
+                try:
+                    metrics = read_metrics(smu, virt)
+                    _log_to_file(f"DetailedRefreshWorker: read_metrics={metrics}")
+                except Exception:
+                    _log_exception_to_file("DetailedRefreshWorker read_metrics")
+            else:
+                _log_to_file("DetailedRefreshWorker: DMA unavailable, skipping OD/metrics reads")
 
             try:
                 smu_state = query_smu_state(smu)
@@ -348,7 +382,7 @@ class ScanThread(QThread):
 
         hw = None
         try:
-            hw = init_hardware()
+            hw = init_hardware(skip_dma_discovery=True)
             _log_to_file(f"ScanThread: init OK, dma_path={hw['dma_path']}")
             inpout = hw["inpout"]
         except Exception as e:
@@ -357,6 +391,8 @@ class ScanThread(QThread):
                 ScanResult([], [], [], [], False, [], error=f"Hardware init failed: {e}")
             )
             return
+
+        dma_ok = hw.get("virt") is not None
 
         try:
             settings = OverclockSettings(
@@ -370,6 +406,10 @@ class ScanThread(QThread):
             def on_progress(pct: float, msg: str):
                 self.progress_signal.emit(pct, msg)
 
+            if not dma_ok:
+                on_progress(2, "DMA buffer not found — run DRAM Scan to enable "
+                               "OD/metrics readback and save the address for future sessions")
+
             result = scan_for_pptable(
                 inpout,
                 settings,
@@ -378,7 +418,6 @@ class ScanThread(QThread):
                 vbios_values=vbios_values,
             )
             if result and self.merge_with_addrs:
-                # Only merge old addrs whose page offset matches the new results
                 if result.valid_addrs:
                     offsets = Counter(a & 0xFFF for a in result.valid_addrs)
                     dominant_offset, _ = offsets.most_common(1)[0]
@@ -396,8 +435,7 @@ class ScanThread(QThread):
                     match_details=result.match_details,
                     od_table=result.od_table,
                 )
-            # Read OD table from SMU for GUI "orig" values (before cleanup)
-            if hw and result:
+            if hw and result and dma_ok:
                 try:
                     od = read_od(hw["smu"], hw["virt"])
                     if od is not None:
@@ -436,7 +474,7 @@ class VramDmaScanWorker(QThread):
 
         hw = None
         try:
-            hw = init_hardware(gui_log=self.log_signal.emit)
+            hw = init_hardware(gui_log=self.log_signal.emit, skip_dma_discovery=True)
             _log_to_file(f"VramDmaScanWorker: init OK, vram_bar=0x{hw['vram_bar']:X}")
         except Exception as e:
             _log_exception_to_file("VramDmaScanWorker init_hardware")
@@ -458,6 +496,7 @@ class VramDmaScanWorker(QThread):
             if result:
                 _log_to_file(f"VramDmaScanWorker: found offset=0x{result['offset']:X} "
                              f"method={result['method']}")
+                _set_inmemory_dma(result['offset'], result['method'])
                 self.log_signal.emit(
                     f"VRAM scan found DMA buffer at offset 0x{result['offset']:X} "
                     f"(method: {result['method']})")
@@ -474,104 +513,81 @@ class VramDmaScanWorker(QThread):
                 cleanup_hardware(hw)
 
 
-class VramDumpWorker(QThread):
-    """Background worker that dumps the visible VRAM BAR to a gzip-compressed file."""
+# ---------------------------------------------------------------------------
+# PFE Settings Worker (PPTable PFE_Settings_t read / patch)
+# ---------------------------------------------------------------------------
 
-    progress_signal = Signal(float, str)      # (0..1, status message)
-    finished_signal = Signal(str, object)     # (file_path | error_msg, metadata_dict | None)
 
-    CHUNK = 0x400000  # 4 MB per read
+class PfeWorker(QThread):
+    """Background worker for PFE_Settings_t operations (read, patch, cap check)."""
 
-    def __init__(self, save_path: str, parent=None):
+    result_signal = Signal(str, object)  # (action, result_dict)
+
+    def __init__(self, action: str, parent=None, **kwargs):
         super().__init__(parent)
-        self.save_path = save_path
+        self.action = action
+        self.kwargs = kwargs
 
     def run(self):
-        _log_to_file("VramDumpWorker: starting")
         hw = None
-        t0 = time.time()
+        _log_to_file(f"PfeWorker[{self.action}]: starting")
         try:
-            self.progress_signal.emit(0.0, "Initializing hardware...")
-            hw = init_hardware()
-            inpout = hw["inpout"]
-            smu    = hw["smu"]
-            vram_bar = hw["vram_bar"]
-            dma_path = hw["dma_path"]
-            mmio   = hw["mmio"]
+            hw = init_hardware(skip_dma_discovery=True)
+            smu = hw["smu"]
+            virt = hw["virt"]
+            _log_to_file(f"PfeWorker[{self.action}]: hw init OK")
 
-            self.progress_signal.emit(0.0, "Detecting BAR size...")
-            bar_size = detect_bar_size(inpout, vram_bar)
-            if bar_size <= 0:
-                self.finished_signal.emit(
-                    "BAR size detection failed (0 bytes accessible)", None)
+            if virt is None:
+                self.result_signal.emit(self.action,
+                    {"error": "DMA buffer not available — run DRAM Scan first"})
                 return
 
-            self.progress_signal.emit(0.0, "Triggering SMU metrics transfer...")
-            smu.send_msg(smu.transfer_read, TABLE_SMU_METRICS)
-            time.sleep(0.15)
-            smu.send_msg(smu.transfer_read, TABLE_SMU_METRICS)
-            time.sleep(0.15)
+            if self.action == "read_pfe":
+                result = read_pfe_settings(smu, virt)
+                if result is None:
+                    result = {"error": "Failed to read PFE_Settings_t"}
+                else:
+                    result['debug_overrides_decoded'] = decode_debug_overrides(
+                        result['debug_overrides'])
 
-            smu_ver = smu.get_smu_version()
-            vram_start, fb_raw = read_vram_start(mmio)
+            elif self.action == "patch_features":
+                extra_bits = self.kwargs.get("extra_bits", [])
+                result = patch_features_to_run(smu, virt, extra_bits)
 
-            metadata = {
-                "vram_bar":          f"0x{vram_bar:X}",
-                "bar_size_bytes":    bar_size,
-                "bar_size_mb":       bar_size // (1 << 20),
-                "dma_path":          dma_path,
-                "smu_version":       list(smu_ver) if isinstance(smu_ver, tuple) else smu_ver,
-                "transfer_read":     f"0x{smu.transfer_read:02X}",
-                "mmhub_vram_start":  f"0x{vram_start:X}",
-                "mmhub_fb_raw":      f"0x{fb_raw:08X}",
-            }
+            elif self.action == "patch_debug":
+                flags = self.kwargs.get("flags", 0)
+                result = patch_debug_overrides(smu, virt, flags)
 
-            dump_size = bar_size + 0x1000
-            total_chunks = max(1, (dump_size + self.CHUNK - 1) // self.CHUNK)
-            total_mb = dump_size // (1 << 20)
-            self.progress_signal.emit(0.0, f"Dumping {total_mb} MB...")
+            elif self.action == "patch_features_tools":
+                extra_bits = self.kwargs.get("extra_bits", [])
+                mmio = hw["mmio"]
+                phys = hw["phys"]
+                vram_bar = hw["vram_bar"]
+                result = patch_features_tools_path(
+                    smu, virt, extra_bits, mmio, phys, vram_bar)
 
-            os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
-            with gzip.open(self.save_path, "wb", compresslevel=6) as gz:
-                for i in range(total_chunks):
-                    chunk_base = i * self.CHUNK
-                    chunk_sz = min(self.CHUNK, dump_size - chunk_base)
-                    try:
-                        cv, ch = inpout.map_phys(vram_bar + chunk_base, chunk_sz)
-                        snap = read_buf(cv, chunk_sz)
-                        inpout.unmap_phys(cv, ch)
-                        gz.write(snap)
-                    except Exception as e:
-                        _log_to_file(f"VramDumpWorker: chunk {i} @ 0x{chunk_base:X} failed: {e}")
-                        gz.write(b'\x00' * chunk_sz)
+            elif self.action == "patch_debug_tools":
+                flags = self.kwargs.get("flags", 0)
+                mmio = hw["mmio"]
+                phys = hw["phys"]
+                vram_bar = hw["vram_bar"]
+                result = patch_debug_tools_path(
+                    smu, virt, flags, mmio, phys, vram_bar)
 
-                    pct = (i + 1) / total_chunks
-                    mb_done = min((i + 1) * self.CHUNK // (1 << 20), total_mb)
-                    self.progress_signal.emit(pct, f"Dumped {mb_done} / {total_mb} MB")
+            elif self.action == "check_od_caps":
+                result = check_od_mem_timing_caps(smu, virt)
 
-            elapsed = time.time() - t0
-            compressed_size = os.path.getsize(self.save_path)
-            metadata["dump_size_bytes"]       = dump_size
-            metadata["compressed_size_bytes"] = compressed_size
-            metadata["elapsed_seconds"]       = round(elapsed, 2)
+            else:
+                result = {"error": f"Unknown action: {self.action}"}
 
-            sidecar_path = self.save_path.rsplit(".bin.gz", 1)[0] + ".meta.json" \
-                if self.save_path.endswith(".bin.gz") \
-                else self.save_path + ".meta.json"
-            with open(sidecar_path, "w") as f:
-                json.dump(metadata, f, indent=2)
-
-            _log_to_file(
-                f"VramDumpWorker: completed in {elapsed:.1f}s, "
-                f"{compressed_size / (1 << 20):.1f} MB compressed")
-            self.finished_signal.emit(self.save_path, metadata)
-
+            _log_to_file(f"PfeWorker[{self.action}]: done")
+            self.result_signal.emit(self.action, result)
         except Exception as e:
-            _log_exception_to_file("VramDumpWorker")
-            self.finished_signal.emit(f"VRAM dump failed: {e}", None)
+            _log_exception_to_file(f"PfeWorker[{self.action}]")
+            self.result_signal.emit(self.action, {"error": str(e)})
         finally:
             if hw:
                 try:
                     cleanup_hardware(hw)
                 except Exception:
-                    _log_exception_to_file("VramDumpWorker cleanup")
+                    _log_exception_to_file(f"PfeWorker[{self.action}] cleanup")

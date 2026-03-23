@@ -1,5 +1,5 @@
 """
-overclock_engine.py -- Core Overclock Engine for RDNA4 GPUs
+overclock_engine.py -- Core Overclock Engine for Adrenalift
 ============================================================
 
 Provides callable functions for GUI and CLI integration:
@@ -7,7 +7,8 @@ Provides callable functions for GUI and CLI integration:
   init_hardware()            -> hardware handle dict
   scan_for_pptable()         -> ScanResult with validated addresses
   patch_pptable()            -> list of per-copy patch reports
-  apply_od_settings()        -> dict of SMU command results
+  apply_od_settings()        -> dict of SMU command results (admin DMA path)
+  apply_od_via_escape()      -> dict of results (no-admin D3DKMTEscape path)
   verify_patches()           -> (all_ok, overwritten_count, details)
   cleanup_hardware()         -> release hardware handles
 
@@ -36,7 +37,9 @@ else:
     _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.io.mmio import InpOut32
-from src.engine.smu import create_smu, PPSMC, PPCLK, SMU_FEATURE, _CLK_NAMES, _FEATURE_NAMES_LOW
+from src.engine.smu import (create_smu, PPSMC, PPCLK, SMU_FEATURE,
+                             _CLK_NAMES, _FEATURE_NAMES_LOW,
+                             SMU_RESP_OK, SMU_RESP_FAIL, _RESP_NAMES)
 
 _engine_log = logging.getLogger("overclock.engine")
 
@@ -48,6 +51,7 @@ def _elog(msg: str):
     except Exception:
         pass
 from src.engine.od_table import (TABLE_OVERDRIVE, TABLE_SMU_METRICS, TABLE_PPTABLE,
+                      TABLE_CUSTOM_SKUTABLE,
                       decode_od_fail,
                       OverDriveTable_t, _OD_TABLE_SIZE,
                       PP_OD_FEATURE_PPT_BIT, PP_OD_FEATURE_GFXCLK_BIT,
@@ -55,9 +59,13 @@ from src.engine.od_table import (TABLE_OVERDRIVE, TABLE_SMU_METRICS, TABLE_PPTAB
                       PP_OD_FEATURE_FCLK_BIT, PP_OD_FEATURE_GFX_VF_CURVE_BIT,
                       PP_OD_FEATURE_GFX_VMAX_BIT, PP_OD_FEATURE_SOC_VMAX_BIT,
                       PP_OD_FEATURE_FAN_CURVE_BIT, PP_OD_FEATURE_EDC_BIT,
+                      PP_OD_FEATURE_FULL_CTRL_BIT,
                       PP_NUM_OD_VF_CURVE_POINTS)
 from src.engine.smu_metrics import (SmuMetrics_t, SMU_METRICS_SIZE,
                                      parse_metrics, metrics_to_dict)
+from src.io.escape_structures import Od8Setting, OD8_RDNA4_FIELD_MAP, OdFail
+from src.io.d3dkmt_escape import D3DKMTClient, D3DKMTError
+from src.app.settings import settings as _settings
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -98,38 +106,53 @@ ML_TEMP_VR_SOC   = 32
 
 
 # ---------------------------------------------------------------------------
-# DMA offset cache
+# DMA offset cache  (delegates to unified settings.json)
 # ---------------------------------------------------------------------------
-
-_DMA_CACHE_PATH = os.path.join(_project_root, ".dma_offset_cache.json")
 
 
 def _load_dma_cache():
     """Load cached DMA buffer offset from disk. Returns int or None."""
-    try:
-        with open(_DMA_CACHE_PATH, "r") as f:
-            data = json.load(f)
-        offset = data.get("offset")
-        if isinstance(offset, int) and offset > 0:
-            return offset
-    except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
-        pass
+    offset = _settings.get("dma_cache.offset")
+    if isinstance(offset, int) and offset > 0:
+        return offset
     return None
 
 
 def _save_dma_cache(offset: int, method: str):
     """Persist the discovered DMA buffer offset to disk."""
     try:
-        data = {
+        _settings.set("dma_cache", {
             "offset": offset,
             "method": method,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        }
-        with open(_DMA_CACHE_PATH, "w") as f:
-            json.dump(data, f, indent=2)
+        })
         _elog(f"_save_dma_cache: wrote offset=0x{offset:X} method={method}")
     except Exception as e:
         _elog(f"_save_dma_cache: failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# In-memory DMA offset cache (shared across threads within one process)
+# ---------------------------------------------------------------------------
+
+_inmemory_dma_lock = threading.Lock()
+_inmemory_dma_offset: int | None = None
+_inmemory_dma_path: str | None = None
+
+
+def _get_inmemory_dma():
+    """Return (offset, dma_path) from the in-memory cache, or (None, None)."""
+    with _inmemory_dma_lock:
+        return _inmemory_dma_offset, _inmemory_dma_path
+
+
+def _set_inmemory_dma(offset: int, dma_path: str):
+    """Store a discovered DMA offset in the in-memory cache."""
+    global _inmemory_dma_offset, _inmemory_dma_path
+    with _inmemory_dma_lock:
+        _inmemory_dma_offset = offset
+        _inmemory_dma_path = dma_path
+    _elog(f"_set_inmemory_dma: offset=0x{offset:X} path={dma_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +401,464 @@ def read_smu_table_raw(smu, virt, table_id, read_size=8192):
     except Exception as e:
         _elog(f"read_smu_table_raw: table_id={table_id} failed: {e}")
         return None, None
+
+
+# ---------------------------------------------------------------------------
+# PFE_Settings_t -- PPTable header parsing and patching
+# ---------------------------------------------------------------------------
+#
+# Layout from smu14_driver_if_v14_0.h:
+#   uint8_t  Version;           // offset 0
+#   uint8_t  Spare8[3];         // offset 1
+#   uint32_t FeaturesToRun[2];  // offset 4  (bits 0-31 at [0], bits 32-63 at [1])
+#   uint32_t FwDStateMask;      // offset 12
+#   uint32_t DebugOverrides;    // offset 16
+#   uint32_t Spare[2];          // offset 20
+# Total: 28 bytes
+
+PFE_FEATURES_TO_RUN_OFFSET = 4
+PFE_FW_DSTATE_MASK_OFFSET  = 12
+PFE_DEBUG_OVERRIDES_OFFSET = 16
+PFE_SETTINGS_SIZE          = 28
+
+DEBUG_OVERRIDE_DISABLE_VOLT_LINK_DCN_FCLK     = 0x00000002
+DEBUG_OVERRIDE_DISABLE_VOLT_LINK_MP0_FCLK     = 0x00000004
+DEBUG_OVERRIDE_DISABLE_VOLT_LINK_VCN_DCFCLK   = 0x00000008
+DEBUG_OVERRIDE_DISABLE_FAST_FCLK_TIMER        = 0x00000010
+DEBUG_OVERRIDE_DISABLE_VCN_PG                 = 0x00000020
+DEBUG_OVERRIDE_DISABLE_FMAX_VMAX              = 0x00000040
+DEBUG_OVERRIDE_DISABLE_IMU_FW_CHECKS          = 0x00000080
+DEBUG_OVERRIDE_DISABLE_DFLL                   = 0x00000200
+DEBUG_OVERRIDE_DFLL_MASTER_MODE               = 0x00000800
+DEBUG_OVERRIDE_ENABLE_PROFILING_MODE          = 0x00001000
+DEBUG_OVERRIDE_ENABLE_PER_WGP_RESIENCY       = 0x00004000
+DEBUG_OVERRIDE_DISABLE_MEMORY_VOLTAGE_SCALING = 0x00008000
+
+_DEBUG_OVERRIDE_NAMES = {
+    0x00000001: "NOT_USE",
+    0x00000002: "DISABLE_VOLT_LINK_DCN_FCLK",
+    0x00000004: "DISABLE_VOLT_LINK_MP0_FCLK",
+    0x00000008: "DISABLE_VOLT_LINK_VCN_DCFCLK",
+    0x00000010: "DISABLE_FAST_FCLK_TIMER",
+    0x00000020: "DISABLE_VCN_PG",
+    0x00000040: "DISABLE_FMAX_VMAX",
+    0x00000080: "DISABLE_IMU_FW_CHECKS",
+    0x00000100: "DISABLE_D0i2_REENTRY_HSR_TIMER_CHECK",
+    0x00000200: "DISABLE_DFLL",
+    0x00000400: "ENABLE_RLC_VF_BRINGUP_MODE",
+    0x00000800: "DFLL_MASTER_MODE",
+    0x00001000: "ENABLE_PROFILING_MODE",
+    0x00002000: "ENABLE_SOC_VF_BRINGUP_MODE",
+    0x00004000: "ENABLE_PER_WGP_RESIENCY",
+    0x00008000: "DISABLE_MEMORY_VOLTAGE_SCALING",
+    0x00010000: "DFLL_BTC_FCW_LOG",
+}
+
+
+def decode_debug_overrides(value):
+    """Decode DebugOverrides bitmask into list of (flag_value, name) tuples."""
+    active = []
+    for flag, name in sorted(_DEBUG_OVERRIDE_NAMES.items()):
+        if value & flag:
+            active.append((flag, name))
+    return active
+
+
+def read_pfe_settings(smu, virt):
+    """Read TABLE_PPTABLE via SMU DMA and parse PFE_Settings_t (first 28 bytes).
+
+    Returns dict with version, features, FwDStateMask, DebugOverrides, or None on failure.
+    """
+    resp, raw = read_smu_table_raw(smu, virt, TABLE_PPTABLE, read_size=256)
+    if raw is None or len(raw) < PFE_SETTINGS_SIZE:
+        _elog("read_pfe_settings: failed or too short")
+        return None
+
+    version = raw[0]
+    feat_lo = struct.unpack_from('<I', raw, 4)[0]
+    feat_hi = struct.unpack_from('<I', raw, 8)[0]
+    fw_dstate = struct.unpack_from('<I', raw, 12)[0]
+    debug_ov = struct.unpack_from('<I', raw, 16)[0]
+    spare0, spare1 = struct.unpack_from('<II', raw, 20)
+
+    feat_64 = feat_lo | (feat_hi << 32)
+    _elog(f"read_pfe_settings: ver={version} feat=0x{feat_64:016X} "
+          f"dstate=0x{fw_dstate:08X} dbg=0x{debug_ov:08X}")
+
+    return {
+        'version': version,
+        'features_to_run_lo': feat_lo,
+        'features_to_run_hi': feat_hi,
+        'features_to_run_64': feat_64,
+        'fw_dstate_mask': fw_dstate,
+        'debug_overrides': debug_ov,
+        'spare': [spare0, spare1],
+        'raw_28': raw[:PFE_SETTINGS_SIZE],
+    }
+
+
+def _read_pptable_full(smu, virt):
+    """Read the full PPTable (~0x3000 bytes) from SMU DMA."""
+    resp, raw = read_smu_table_raw(smu, virt, TABLE_PPTABLE, read_size=0x3000)
+    if raw is None:
+        raise RuntimeError("Failed to read TABLE_PPTABLE from SMU DMA")
+    return raw
+
+
+def _write_pptable_back(smu, virt, data):
+    """Write patched PPTable data to DMA buffer and transfer to SMU."""
+    write_buf(virt, bytes(data))
+    smu.hdp_flush()
+    resp, ret = smu.send_msg(smu.transfer_write, TABLE_PPTABLE)
+    _elog(f"_write_pptable_back: resp=0x{resp:02X} ret=0x{ret:08X}")
+    return resp, ret
+
+
+def patch_features_to_run(smu, virt, extra_bits):
+    """Patch FeaturesToRun in the PPTable to add the given feature bit positions.
+
+    Args:
+        extra_bits: list of feature bit positions to OR in (e.g. [41, 43, 49]).
+
+    Returns dict with old/new values, SMU response, and verification read-back.
+    """
+    pfe = read_pfe_settings(smu, virt)
+    if pfe is None:
+        raise RuntimeError("Failed to read PFE_Settings_t")
+
+    old_lo, old_hi = pfe['features_to_run_lo'], pfe['features_to_run_hi']
+    new_lo, new_hi = old_lo, old_hi
+
+    for bit in extra_bits:
+        if bit < 32:
+            new_lo |= (1 << bit)
+        else:
+            new_hi |= (1 << (bit - 32))
+
+    features_before = smu.get_running_features()
+
+    raw = _read_pptable_full(smu, virt)
+    data = bytearray(raw)
+    struct.pack_into('<I', data, PFE_FEATURES_TO_RUN_OFFSET, new_lo)
+    struct.pack_into('<I', data, PFE_FEATURES_TO_RUN_OFFSET + 4, new_hi)
+
+    resp, ret = _write_pptable_back(smu, virt, data)
+
+    time.sleep(0.2)
+    after_pfe = read_pfe_settings(smu, virt)
+    features_after = smu.get_running_features()
+
+    newly_enabled = features_after & ~features_before
+    bits_added = []
+    for bit in extra_bits:
+        name = _FEATURE_NAMES_LOW.get(bit, f"BIT_{bit}")
+        was_on = bool(features_before & (1 << bit))
+        now_on = bool(features_after & (1 << bit))
+        bits_added.append((bit, name, was_on, now_on))
+
+    return {
+        'old_lo': old_lo, 'old_hi': old_hi,
+        'new_lo': new_lo, 'new_hi': new_hi,
+        'smu_resp': resp, 'smu_ret': ret,
+        'features_before': features_before,
+        'features_after': features_after,
+        'newly_enabled': newly_enabled,
+        'bits_detail': bits_added,
+        'after_pfe': after_pfe,
+    }
+
+
+def patch_debug_overrides(smu, virt, flags_to_set):
+    """Patch DebugOverrides in PFE_Settings to set the given flag bitmask.
+
+    Args:
+        flags_to_set: uint32 bitmask of flags to OR into DebugOverrides.
+
+    Returns dict with old/new values, SMU response, and verification.
+    """
+    pfe = read_pfe_settings(smu, virt)
+    if pfe is None:
+        raise RuntimeError("Failed to read PFE_Settings_t")
+
+    old_dbg = pfe['debug_overrides']
+    new_dbg = old_dbg | flags_to_set
+
+    raw = _read_pptable_full(smu, virt)
+    data = bytearray(raw)
+    struct.pack_into('<I', data, PFE_DEBUG_OVERRIDES_OFFSET, new_dbg)
+
+    resp, ret = _write_pptable_back(smu, virt, data)
+
+    after_pfe = read_pfe_settings(smu, virt)
+
+    flags_set = []
+    for flag, name in sorted(_DEBUG_OVERRIDE_NAMES.items()):
+        if flags_to_set & flag:
+            was_set = bool(old_dbg & flag)
+            now_set = bool(after_pfe['debug_overrides'] & flag) if after_pfe else None
+            flags_set.append((flag, name, was_set, now_set))
+
+    return {
+        'old_debug_overrides': old_dbg,
+        'new_debug_overrides': new_dbg,
+        'flags_applied': flags_to_set,
+        'smu_resp': resp, 'smu_ret': ret,
+        'flags_detail': flags_set,
+        'after_pfe': after_pfe,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tools DRAM Path -- TABLE_PPTABLE write via msg 0x53 (Phase 6)
+# ---------------------------------------------------------------------------
+#
+# The Driver path (msg 0x13 TransferTableDram2Smu) is rejected by PMFW for
+# TABLE_PPTABLE writes (returns 0xFF FAIL).  The Tools path (msg 0x53
+# TransferTableDram2SmuWithAddr) uses a separate DRAM address register
+# that the Windows driver never touches.  PMFW may have different
+# validation for the Tools path.
+
+
+def _compute_mc_addr(mmio, phys, vram_bar):
+    """Compute the GPU MC address for a CPU physical address in VRAM.
+
+    MC address = vram_start + (phys - vram_bar), where vram_start comes
+    from the MMHUB FB_LOCATION_BASE register.
+
+    Returns (mc_addr, vram_start) or raises RuntimeError.
+    """
+    vram_start, raw_reg = _read_vram_start(mmio)
+    offset = phys - vram_bar
+    mc_addr = vram_start + offset
+    _elog(f"_compute_mc_addr: phys=0x{phys:X} vram_bar=0x{vram_bar:X} "
+          f"offset=0x{offset:X} vram_start=0x{vram_start:X} "
+          f"mc_addr=0x{mc_addr:X} (raw_reg=0x{raw_reg:X})")
+    return mc_addr, vram_start
+
+
+def _write_pptable_tools_path(smu, virt, data, mmio, phys, vram_bar):
+    """Write patched PPTable data via the Tools DRAM path (msg 0x53).
+
+    Tries TABLE_PPTABLE (id=0) first, falls back to TABLE_CUSTOM_SKUTABLE
+    (id=12) if PMFW rejects the primary table ID.
+
+    Args:
+        smu:      SmuCmd instance.
+        virt:     Virtual address of the mapped DMA buffer.
+        data:     Patched PPTable bytes to write.
+        mmio:     GpuMMIO instance (for vram_start readback).
+        phys:     CPU physical address of the DMA buffer.
+        vram_bar: GPU BAR0 physical base address.
+
+    Returns:
+        dict with keys: mc_addr, vram_start, table_id_used, attempts
+        (list of {table_id, resp, ret}), success (bool).
+    """
+    mc_addr, vram_start = _compute_mc_addr(mmio, phys, vram_bar)
+
+    old_read, old_write = smu.setup_tools_dram(mc_addr)
+    result = {
+        'mc_addr': mc_addr,
+        'vram_start': vram_start,
+        'table_id_used': None,
+        'attempts': [],
+        'success': False,
+    }
+    try:
+        write_buf(virt, bytes(data))
+        smu.hdp_flush()
+
+        for table_id, label in [(TABLE_PPTABLE, "TABLE_PPTABLE"),
+                                 (TABLE_CUSTOM_SKUTABLE, "TABLE_CUSTOM_SKUTABLE")]:
+            resp, ret = smu.transfer_table_tools_to_smu(table_id)
+            attempt = {
+                'table_id': table_id,
+                'label': label,
+                'resp': resp,
+                'ret': ret,
+            }
+            result['attempts'].append(attempt)
+            _elog(f"_write_pptable_tools_path: {label} (id={table_id}) "
+                  f"resp=0x{resp:02X} ret=0x{ret:08X}")
+
+            if resp == SMU_RESP_OK:
+                result['table_id_used'] = table_id
+                result['success'] = True
+                _elog(f"_write_pptable_tools_path: SUCCESS via {label}")
+                break
+            _elog(f"_write_pptable_tools_path: {label} failed, "
+                  f"resp={_RESP_NAMES.get(resp, f'0x{resp:02X}')}")
+    finally:
+        smu.restore_transfer_msgs(old_read, old_write)
+
+    return result
+
+
+def _read_pptable_tools_path(smu, virt, mmio, phys, vram_bar, read_size=0x3000):
+    """Read TABLE_PPTABLE via the Tools DRAM path (msg 0x52).
+
+    Returns (raw_bytes, mc_addr, vram_start) or raises RuntimeError.
+    """
+    mc_addr, vram_start = _compute_mc_addr(mmio, phys, vram_bar)
+
+    smu.set_dram_addr(mc_addr, use_tools=True)
+    resp, ret = smu.transfer_table_tools_from_smu(TABLE_PPTABLE)
+    if resp != SMU_RESP_OK:
+        raise RuntimeError(
+            f"Tools path read TABLE_PPTABLE failed: "
+            f"{_RESP_NAMES.get(resp, f'0x{resp:02X}')} (ret=0x{ret:08X})")
+    smu.hdp_flush()
+    raw = read_buf(virt, min(read_size, 0x3000))
+    _elog(f"_read_pptable_tools_path: read {len(raw)} bytes via 0x52, "
+          f"mc_addr=0x{mc_addr:X}")
+    return raw, mc_addr, vram_start
+
+
+def patch_features_tools_path(smu, virt, extra_bits, mmio, phys, vram_bar):
+    """Patch FeaturesToRun via the Tools DRAM path (msg 0x53).
+
+    Same as patch_features_to_run() but writes back using
+    TransferTableDram2SmuWithAddr instead of TransferTableDram2Smu.
+
+    Returns dict with old/new values, per-attempt SMU responses, verification.
+    """
+    pfe = read_pfe_settings(smu, virt)
+    if pfe is None:
+        raise RuntimeError("Failed to read PFE_Settings_t")
+
+    old_lo, old_hi = pfe['features_to_run_lo'], pfe['features_to_run_hi']
+    new_lo, new_hi = old_lo, old_hi
+
+    for bit in extra_bits:
+        if bit < 32:
+            new_lo |= (1 << bit)
+        else:
+            new_hi |= (1 << (bit - 32))
+
+    features_before = smu.get_running_features()
+
+    raw = _read_pptable_full(smu, virt)
+    data = bytearray(raw)
+    struct.pack_into('<I', data, PFE_FEATURES_TO_RUN_OFFSET, new_lo)
+    struct.pack_into('<I', data, PFE_FEATURES_TO_RUN_OFFSET + 4, new_hi)
+
+    write_result = _write_pptable_tools_path(smu, virt, data, mmio, phys, vram_bar)
+
+    time.sleep(0.2)
+    after_pfe = read_pfe_settings(smu, virt)
+    features_after = smu.get_running_features()
+
+    newly_enabled = features_after & ~features_before
+    bits_added = []
+    for bit in extra_bits:
+        name = _FEATURE_NAMES_LOW.get(bit, f"BIT_{bit}")
+        was_on = bool(features_before & (1 << bit))
+        now_on = bool(features_after & (1 << bit))
+        bits_added.append((bit, name, was_on, now_on))
+
+    return {
+        'old_lo': old_lo, 'old_hi': old_hi,
+        'new_lo': new_lo, 'new_hi': new_hi,
+        'write_result': write_result,
+        'features_before': features_before,
+        'features_after': features_after,
+        'newly_enabled': newly_enabled,
+        'bits_detail': bits_added,
+        'after_pfe': after_pfe,
+    }
+
+
+def patch_debug_tools_path(smu, virt, flags_to_set, mmio, phys, vram_bar):
+    """Patch DebugOverrides via the Tools DRAM path (msg 0x53).
+
+    Same as patch_debug_overrides() but writes back using the Tools path.
+    """
+    pfe = read_pfe_settings(smu, virt)
+    if pfe is None:
+        raise RuntimeError("Failed to read PFE_Settings_t")
+
+    old_dbg = pfe['debug_overrides']
+    new_dbg = old_dbg | flags_to_set
+
+    raw = _read_pptable_full(smu, virt)
+    data = bytearray(raw)
+    struct.pack_into('<I', data, PFE_DEBUG_OVERRIDES_OFFSET, new_dbg)
+
+    write_result = _write_pptable_tools_path(smu, virt, data, mmio, phys, vram_bar)
+
+    after_pfe = read_pfe_settings(smu, virt)
+
+    flags_set = []
+    for flag, name in sorted(_DEBUG_OVERRIDE_NAMES.items()):
+        if flags_to_set & flag:
+            was_set = bool(old_dbg & flag)
+            now_set = bool(after_pfe['debug_overrides'] & flag) if after_pfe else None
+            flags_set.append((flag, name, was_set, now_set))
+
+    return {
+        'old_debug_overrides': old_dbg,
+        'new_debug_overrides': new_dbg,
+        'flags_applied': flags_to_set,
+        'write_result': write_result,
+        'flags_detail': flags_set,
+        'after_pfe': after_pfe,
+    }
+
+
+def check_od_mem_timing_caps(smu, virt):
+    """Check OD capabilities related to memory timing tuning.
+
+    Reads:
+    1. The current OD table FeatureCtrlMask for UCLK/FCLK OD bits.
+    2. The raw PPTable at PP_OD_CAPABILITY_FLAGS_OFFSET (0x105C) for
+       the OverDriveLimitsBasicMin FeatureCtrlMask baked in by VBIOS.
+    3. UCLK DPM min/max from SMU queries.
+    4. The OD table's current UclkFmin/UclkFmax settings.
+
+    Returns dict with all capability data.
+    """
+    from src.io.escape_structures import PP_OD_CAPABILITY_FLAGS_OFFSET
+
+    result = {'caps': {}, 'od_features': {}, 'uclk': {}, 'pptable_raw_caps': None}
+
+    try:
+        uclk_min = smu.get_min_freq(PPCLK.UCLK)
+        uclk_max = smu.get_max_freq(PPCLK.UCLK)
+        result['uclk']['dpm_min'] = uclk_min
+        result['uclk']['dpm_max'] = uclk_max
+    except Exception as e:
+        result['uclk']['error'] = str(e)
+
+    od = read_od(smu, virt)
+    if od is not None:
+        mask = od.FeatureCtrlMask
+        result['od_features']['FeatureCtrlMask'] = mask
+        result['od_features']['UCLK_bit'] = bool(mask & (1 << PP_OD_FEATURE_UCLK_BIT))
+        result['od_features']['FCLK_bit'] = bool(mask & (1 << PP_OD_FEATURE_FCLK_BIT))
+        result['od_features']['FULL_CTRL_bit'] = bool(
+            mask & (1 << PP_OD_FEATURE_FULL_CTRL_BIT))
+        result['uclk']['od_UclkFmin'] = od.UclkFmin
+        result['uclk']['od_UclkFmax'] = od.UclkFmax
+        result['uclk']['od_FclkFmin'] = od.FclkFmin
+        result['uclk']['od_FclkFmax'] = od.FclkFmax
+    else:
+        result['od_features']['error'] = "Failed to read OD table"
+
+    try:
+        resp, raw = read_smu_table_raw(smu, virt, TABLE_PPTABLE, read_size=0x3000)
+        if raw is not None and len(raw) > PP_OD_CAPABILITY_FLAGS_OFFSET + 4:
+            cap_flags = struct.unpack_from('<I', raw, PP_OD_CAPABILITY_FLAGS_OFFSET)[0]
+            result['pptable_raw_caps'] = cap_flags
+            result['caps']['raw_at_0x105C'] = f"0x{cap_flags:08X}"
+            result['caps']['UCLK_bit_in_pptable'] = bool(
+                cap_flags & (1 << PP_OD_FEATURE_UCLK_BIT))
+            result['caps']['FCLK_bit_in_pptable'] = bool(
+                cap_flags & (1 << PP_OD_FEATURE_FCLK_BIT))
+    except Exception as e:
+        result['caps']['pptable_error'] = str(e)
+
+    _elog(f"check_od_mem_timing_caps: result keys={list(result.keys())}")
+    return result
 
 
 def read_clock_block(inpout, phys_addr):
@@ -1646,16 +2127,24 @@ def _load_vbios_values():
     return vals
 
 
-def init_hardware(gui_log=None):
+def init_hardware(gui_log=None, skip_dma_discovery=False):
     """Initialize hardware drivers and map the driver DMA buffer.
 
     Locates the Windows driver's existing DMA buffer in VRAM (the SMU
     firmware locks the DMA address at boot and ignores later overrides).
     Falls back to a default offset if validation fails.
 
+    Uses an in-memory cache so that after the first successful discovery
+    (e.g. by ScanThread), subsequent calls from workers skip the costly
+    BAR scan entirely.
+
     Args:
         gui_log: Optional callable(str) for user-visible log messages
                  (DMA discovery status).
+        skip_dma_discovery: If True, skip the expensive DMA buffer scan
+                 when no cached offset is available.  Returns hw dict
+                 with virt/handle/phys = None and dma_path = 'none'.
+                 In-memory and disk caches are still checked (instant).
 
     Returns a dict with keys:
         wr0, inpout, mmio, smu, vram_bar, virt, handle, phys, dma_path
@@ -1664,11 +2153,59 @@ def init_hardware(gui_log=None):
     _elog("init_hardware: starting")
     wr0, inpout, mmio, smu, vram_bar = create_smu(verbose=False)
 
+    # Fast path: reuse the offset discovered by a previous init_hardware
+    # call in this process (avoids redundant 30+ second BAR scans).
+    mem_offset, mem_path = _get_inmemory_dma()
+    if mem_offset is not None:
+        _elog(f"init_hardware: trying in-memory cached offset "
+              f"0x{mem_offset:X} (path={mem_path})")
+        drv_phys = vram_bar + mem_offset
+        try:
+            virt, handle = inpout.map_phys(drv_phys, 0x4000)
+            dma_path = f"inmemory-{mem_path}"
+            _elog(f"init_hardware: OK — dma_path={dma_path}")
+            return {
+                'wr0': wr0, 'inpout': inpout, 'mmio': mmio, 'smu': smu,
+                'vram_bar': vram_bar, 'virt': virt, 'handle': handle,
+                'phys': drv_phys, 'dma_path': dma_path,
+            }
+        except Exception as e:
+            _elog(f"init_hardware: in-memory cached offset failed: {e}")
+
+    if skip_dma_discovery:
+        cached_offset = _load_dma_cache()
+        if cached_offset is not None:
+            _elog(f"init_hardware: skip_dma_discovery=True, trying disk cache "
+                  f"offset=0x{cached_offset:X}")
+            drv_phys = vram_bar + cached_offset
+            try:
+                virt, handle = inpout.map_phys(drv_phys, 0x4000)
+                dma_path = f"disk-cached-0x{cached_offset:X}"
+                _set_inmemory_dma(cached_offset, dma_path)
+                _elog(f"init_hardware: OK — dma_path={dma_path}")
+                return {
+                    'wr0': wr0, 'inpout': inpout, 'mmio': mmio, 'smu': smu,
+                    'vram_bar': vram_bar, 'virt': virt, 'handle': handle,
+                    'phys': drv_phys, 'dma_path': dma_path,
+                }
+            except Exception as e:
+                _elog(f"init_hardware: disk cache offset failed: {e}")
+
+        _elog("init_hardware: skip_dma_discovery=True, no cached DMA offset "
+              "— DMA unavailable")
+        return {
+            'wr0': wr0, 'inpout': inpout, 'mmio': mmio, 'smu': smu,
+            'vram_bar': vram_bar, 'virt': None, 'handle': None,
+            'phys': None, 'dma_path': 'none',
+        }
+
     vbios_values = _load_vbios_values()
     virt, handle, phys, dma_path = _discover_dma_buffer(
         smu, inpout, vram_bar, vbios_values=vbios_values,
         gui_log=gui_log)
     _elog(f"init_hardware: OK — dma_path={dma_path}")
+
+    _set_inmemory_dma(phys - vram_bar, dma_path)
 
     return {
         'wr0': wr0, 'inpout': inpout, 'mmio': mmio, 'smu': smu,
@@ -2237,56 +2774,37 @@ def patch_pptable(inpout, scan_result, settings, scan_opts=None,
 
 def apply_clocks_only(inpout, smu, scan_result, settings, vbios_values=None,
                       progress_callback=None):
-    """Apply only clock patches (GameClockAc, BoostClockAc) and freq limits.
+    """Patch PPTable clocks in RAM, then DisallowGfxOff + workload mask cycle.
 
-    Validates original values before patching to avoid corrupting drifted memory.
+    Validates via MsgLimits PPT values (stable between VBIOS and RAM, unlike
+    clocks which the driver adjusts via silicon binning).
     Returns dict with results including 'patched_count' and 'skipped_count'.
     """
     cb = progress_callback or _noop_cb
     fp_mode = scan_result and getattr(scan_result, 'fingerprint_validated', False)
     results = {'patched_count': 0, 'skipped_count': 0, 'skipped_addrs': []}
     if scan_result and scan_result.valid_addrs:
-        orig_game = vbios_values.gameclock_ac if vbios_values else ORIG_GAMECLOCK_AC
-        orig_boost = vbios_values.boostclock_ac if vbios_values else ORIG_BOOSTCLOCK_AC
         target_game = settings._game_clock()
         target_boost = settings._boost_clock()
+        expected_ppt0 = vbios_values.power_ac if vbios_values else ORIG_POWER_AC
 
         for addr in scan_result.valid_addrs:
-            current_game = read_u16(inpout, addr, 2)
-            current_boost = read_u16(inpout, addr, 4)
-            if not fp_mode and current_game not in (orig_game, target_game):
-                cb(0, f"SKIP 0x{addr:012X}: GameClock={current_game} != expected "
-                      f"{orig_game} or {target_game}, memory drifted")
-                results['skipped_count'] += 1
-                results['skipped_addrs'].append(addr)
-                continue
-            if not fp_mode and current_boost not in (orig_boost, target_boost):
-                cb(0, f"SKIP 0x{addr:012X}: BoostClock={current_boost} != expected "
-                      f"{orig_boost} or {target_boost}, memory drifted")
-                results['skipped_count'] += 1
-                results['skipped_addrs'].append(addr)
-                continue
+            if not fp_mode:
+                ml_base = addr + 28
+                current_ppt0 = read_u16(inpout, ml_base, ML_PPT0_AC)
+                current_ppt1 = read_u16(inpout, ml_base, ML_PPT1_AC)
+                if current_ppt0 != expected_ppt0 and current_ppt1 != 1200:
+                    current_game = read_u16(inpout, addr, 2)
+                    cb(0, f"SKIP 0x{addr:012X}: PPT0={current_ppt0}W (expected {expected_ppt0}), "
+                          f"PPT1={current_ppt1}W (expected 1200), "
+                          f"GameClock={current_game} — memory drifted")
+                    results['skipped_count'] += 1
+                    results['skipped_addrs'].append(addr)
+                    continue
             patch_u16(inpout, addr, 2, target_game)
             patch_u16(inpout, addr, 4, target_boost)
             results['patched_count'] += 1
-    min_clock = settings.effective_min_clock
-    effective_max = settings.effective_max
-    param_max = ((PPCLK.GFXCLK & 0xFFFF) << 16) | (effective_max & 0xFFFF)
-    param_min = ((PPCLK.GFXCLK & 0xFFFF) << 16) | (min_clock & 0xFFFF)
-    resp, _ = smu.send_msg(PPSMC.SetSoftMaxByFreq, param_max)
-    results['soft_max'] = resp
-    resp, _ = smu.send_msg(PPSMC.SetHardMaxByFreq, param_max)
-    results['hard_max'] = resp
-    resp, _ = smu.send_msg(PPSMC.SetSoftMinByFreq, param_min)
-    results['soft_min'] = resp
-    resp, _ = smu.send_msg(PPSMC.SetHardMinByFreq, param_min)
-    results['hard_min'] = resp
     smu.send_msg(PPSMC.DisallowGfxOff)
-    if settings.effective_lock_features:
-        feat_mask = ((1 << SMU_FEATURE.DS_GFXCLK) |
-                     (1 << SMU_FEATURE.GFX_ULV) |
-                     (1 << SMU_FEATURE.GFXOFF))
-        smu.send_msg(PPSMC.DisableSmuFeaturesLow, feat_mask)
     smu.send_msg(PPSMC.SetWorkloadMask, 1 << 2)
     time.sleep(0.3)
     smu.send_msg(PPSMC.SetWorkloadMask, 1 << 1)
@@ -2366,7 +2884,7 @@ def _apply_pp_field_groups(inpout, scan_result, field_values, field_offset_map, 
             meta = field_offset_map.get(key)
             if not meta:
                 continue
-            if meta.get("group") not in groups:
+            if groups is not None and meta.get("group") not in groups:
                 continue
             off = meta.get("offset")
             typ = str(meta.get("type", "H"))
@@ -2391,6 +2909,34 @@ def _apply_pp_field_groups(inpout, scan_result, field_values, field_offset_map, 
         else:
             results['skipped_count'] += 1
     return results
+
+
+def patch_pp_single_field(inpout, scan_result, offset, value, type_code="H"):
+    """Patch exactly one PP field (1/2/4 bytes) across all valid physical addresses.
+
+    Returns {"ok": bool, "writes": int, "addrs": int}.
+    """
+    result = {"ok": False, "writes": 0, "addrs": 0}
+    if not scan_result or not scan_result.valid_addrs:
+        return result
+    result["addrs"] = len(scan_result.valid_addrs)
+    off = int(offset)
+    val = int(value)
+    typ = str(type_code)
+    for addr in scan_result.valid_addrs:
+        try:
+            if typ in ("B", "b"):
+                _, verify = patch_u8(inpout, addr, off, val)
+            elif typ in ("I", "L", "i", "l"):
+                _, verify = patch_u32(inpout, addr, off, val)
+            else:
+                _, verify = patch_u16(inpout, addr, off, val)
+            if int(verify) == val:
+                result["writes"] += 1
+        except Exception:
+            continue
+    result["ok"] = result["writes"] > 0
+    return result
 
 
 def apply_pp_fan_fields(inpout, scan_result, field_values, field_offset_map, progress_callback=None):
@@ -2605,6 +3151,273 @@ def query_smu_state(smu):
 
     _elog(f"query_smu_state: returned {len(state)} keys")
     return state
+
+
+def settings_to_od8_entries(
+    settings,
+    *,
+    fan_curve_pwm=None,
+    fan_curve_temp=None,
+    fan_mode=None,
+    fan_zero_rpm=None,
+):
+    """Translate OverclockSettings into OD8 index entries for D3DKMTEscape.
+
+    Converts the existing OverclockSettings dataclass fields into a dict
+    of ``{od8_index: (value, is_set)}`` entries suitable for
+    ``build_v2_od_write()``.  Only fields with user-specified (non-default)
+    values produce ``is_set=1`` entries; everything else is omitted so the
+    driver leaves those settings unchanged.
+
+    Fan curve data is accepted as separate keyword arguments because
+    OverclockSettings doesn't carry fan curve fields — those are managed
+    by the GUI's OD table editor.
+
+    Confidence tags from OD8_RDNA4_FIELD_MAP are logged for entries that
+    rely on inferred [I] indices so callers know which writes are less
+    certain than the Frida-confirmed [F] ones.
+
+    Args:
+        settings:       OverclockSettings instance.
+        fan_curve_pwm:  Optional list of up to 6 PWM values (0-255) for
+                        fan curve points 0-5.  Length determines how many
+                        points are set.
+        fan_curve_temp: Optional list of up to 6 temperature values (°C)
+                        for fan curve points 0-5.  Must match the length
+                        of fan_curve_pwm if both are provided.
+        fan_mode:       Optional fan mode (0=auto, 1=manual linear).
+        fan_zero_rpm:   Optional fan zero-RPM enable (0 or 1).
+
+    Returns:
+        Dict mapping OD8 index (int) to ``(value: int, is_set: int)``
+        tuples.  Suitable for passing directly to ``build_v2_od_write()``
+        or ``D3DKMTClient.od_write()``.
+    """
+    entries = {}
+
+    def _set(idx, value):
+        mapping = OD8_RDNA4_FIELD_MAP.get(idx)
+        confidence = mapping.confidence if mapping else "?"
+        if confidence == "I":
+            _elog(f"od8_translate: idx {idx} ({Od8Setting(idx).name}) = {value} "
+                  f"[inferred — not Frida-confirmed]")
+        entries[idx] = (int(value), 1)
+
+    # ── Core OC settings (Frida-confirmed [F]) ──────────────────────────
+
+    _set(Od8Setting.GFXCLK_FOFFSET, settings.offset)
+    _set(Od8Setting.PPT, settings.od_ppt)
+
+    # ── Inferred settings — only when user explicitly set them ──────────
+
+    if settings.od_tdc != 0:
+        _set(Od8Setting.TDC, settings.od_tdc)
+
+    if settings.uclk_min > 0:
+        _set(Od8Setting.UCLK_FMIN, settings.uclk_min)
+    if settings.uclk_max > 0:
+        _set(Od8Setting.UCLK_FMAX, settings.uclk_max)
+
+    if settings.fclk_min > 0:
+        _set(Od8Setting.FCLK_FMIN, settings.fclk_min)
+    if settings.fclk_max > 0:
+        _set(Od8Setting.FCLK_FMAX, settings.fclk_max)
+
+    # ── Fan curve (Frida-confirmed [F] for points 0-4, [G] for pt 5) ───
+
+    _FAN_PWM_INDICES = [
+        Od8Setting.FAN_CURVE_PWM_0, Od8Setting.FAN_CURVE_PWM_1,
+        Od8Setting.FAN_CURVE_PWM_2, Od8Setting.FAN_CURVE_PWM_3,
+        Od8Setting.FAN_CURVE_PWM_4, Od8Setting.FAN_CURVE_PWM_5,
+    ]
+    _FAN_TEMP_INDICES = [
+        Od8Setting.FAN_CURVE_TEMP_0, Od8Setting.FAN_CURVE_TEMP_1,
+        Od8Setting.FAN_CURVE_TEMP_2, Od8Setting.FAN_CURVE_TEMP_3,
+        Od8Setting.FAN_CURVE_TEMP_4, Od8Setting.FAN_CURVE_TEMP_5,
+    ]
+
+    if fan_curve_pwm is not None and fan_curve_temp is not None:
+        if len(fan_curve_pwm) != len(fan_curve_temp):
+            raise ValueError(
+                f"fan_curve_pwm ({len(fan_curve_pwm)} pts) and "
+                f"fan_curve_temp ({len(fan_curve_temp)} pts) must have "
+                f"equal length")
+        n = min(len(fan_curve_pwm), len(_FAN_PWM_INDICES))
+        for i in range(n):
+            _set(_FAN_PWM_INDICES[i], fan_curve_pwm[i])
+            _set(_FAN_TEMP_INDICES[i], fan_curve_temp[i])
+    elif fan_curve_pwm is not None or fan_curve_temp is not None:
+        raise ValueError(
+            "fan_curve_pwm and fan_curve_temp must both be provided "
+            "or both be None")
+
+    # ── Fan mode and zero-RPM (Frida-confirmed [F]) ─────────────────────
+
+    if fan_mode is not None:
+        _set(Od8Setting.FAN_MODE, fan_mode)
+
+    if fan_zero_rpm is not None:
+        _set(Od8Setting.FAN_ZERO_RPM_ENABLE, fan_zero_rpm)
+
+    _elog(f"od8_translate: {len(entries)} entries from settings "
+          f"(offset={settings.offset}, ppt={settings.od_ppt}, "
+          f"tdc={settings.od_tdc}, uclk={settings.uclk_min}/{settings.uclk_max}, "
+          f"fclk={settings.fclk_min}/{settings.fclk_max}, "
+          f"fan_pts={'%d' % len(fan_curve_pwm) if fan_curve_pwm else 'none'})")
+
+    return entries
+
+
+def apply_od_via_escape(
+    settings,
+    *,
+    fan_curve_pwm=None,
+    fan_curve_temp=None,
+    fan_mode=None,
+    fan_zero_rpm=None,
+):
+    """Apply OD settings via the D3DKMTEscape path (no admin required).
+
+    Uses the v2 0x00C000A1 OD8 write protocol — the same mechanism AMD
+    Adrenalin uses at runtime.  Only OD table parameters are applied;
+    SMU frequency floor commands (SetSoftMin, SetHardMin, etc.) and
+    feature disables have no escape equivalent and are skipped.
+
+    Args:
+        settings:       OverclockSettings instance.
+        fan_curve_pwm:  Optional list of up to 6 PWM values for fan curve.
+        fan_curve_temp: Optional list of up to 6 temperature values for fan curve.
+        fan_mode:       Optional fan mode (0=auto, 1=manual).
+        fan_zero_rpm:   Optional fan zero-RPM enable (0 or 1).
+
+    Returns:
+        Dict with keys:
+            'ok'              - bool, True if write succeeded
+            'error'           - str or None, error description on failure
+            'od_fail'         - OdFail enum value (0 = no error)
+            'od_fail_name'    - human-readable OdFail name
+            'status'          - raw response status int
+            'baseline'        - dict of OD8 values before write
+            'verified'        - dict of OD8 values after write
+            'entries_sent'    - dict of entries that were sent
+            'changed_indices' - list of OD8 indices whose values changed
+    """
+    result = {
+        'ok': False,
+        'error': None,
+        'od_fail': OdFail.NO_ERROR,
+        'od_fail_name': 'NO_ERROR',
+        'status': -1,
+        'baseline': {},
+        'verified': {},
+        'entries_sent': {},
+        'changed_indices': [],
+    }
+
+    # ── Translate settings to OD8 entries ─────────────────────────────
+    try:
+        entries = settings_to_od8_entries(
+            settings,
+            fan_curve_pwm=fan_curve_pwm,
+            fan_curve_temp=fan_curve_temp,
+            fan_mode=fan_mode,
+            fan_zero_rpm=fan_zero_rpm,
+        )
+    except (ValueError, TypeError) as e:
+        result['error'] = f"settings translation failed: {e}"
+        _elog(f"apply_od_via_escape: {result['error']}")
+        return result
+
+    result['entries_sent'] = {int(k): v for k, v in entries.items()}
+
+    if not entries:
+        result['error'] = "no OD8 entries to send (all settings are default)"
+        _elog(f"apply_od_via_escape: {result['error']}")
+        return result
+
+    # ── Open D3DKMTClient ─────────────────────────────────────────────
+    try:
+        client = D3DKMTClient.open_amd_adapter()
+    except (RuntimeError, D3DKMTError, OSError) as e:
+        result['error'] = f"failed to open AMD adapter: {e}"
+        _elog(f"apply_od_via_escape: {result['error']}")
+        return result
+
+    try:
+        # ── Session queries (matches Adrenalin pre-write sequence) ────
+        try:
+            client.query_session()
+            client.query_session()
+        except (D3DKMTError, OSError) as e:
+            _elog(f"apply_od_via_escape: session query failed (non-fatal): {e}")
+
+        # ── Read baseline values (no-op write) ───────────────────────
+        try:
+            baseline = client.od_read_current_values()
+            result['baseline'] = baseline
+            _elog(f"apply_od_via_escape: baseline read OK, "
+                  f"{len(baseline)} values")
+        except (D3DKMTError, OSError) as e:
+            _elog(f"apply_od_via_escape: baseline read failed (non-fatal): {e}")
+
+        # ── Send OD8 entries ─────────────────────────────────────────
+        try:
+            resp = client.od_write(entries)
+        except (D3DKMTError, OSError) as e:
+            result['error'] = f"D3DKMTEscape od_write failed: {e}"
+            _elog(f"apply_od_via_escape: {result['error']}")
+            return result
+
+        result['status'] = resp.status
+
+        # ── Check OdFail code ────────────────────────────────────────
+        try:
+            fail_code = OdFail(resp.status)
+        except ValueError:
+            fail_code = OdFail.NO_ERROR if resp.status == 0 else None
+
+        if fail_code is not None:
+            result['od_fail'] = fail_code
+            result['od_fail_name'] = fail_code.name
+        else:
+            result['od_fail'] = resp.status
+            result['od_fail_name'] = f"UNKNOWN_{resp.status}"
+
+        if resp.status != 0:
+            result['error'] = (
+                f"OD write rejected by driver: status={resp.status} "
+                f"({result['od_fail_name']})")
+            _elog(f"apply_od_via_escape: {result['error']}")
+            return result
+
+        _elog(f"apply_od_via_escape: od_write OK, "
+              f"status={resp.status}, success_flag={resp.success_flag}")
+
+        # ── Verify by re-reading current values ──────────────────────
+        try:
+            verified = client.od_read_current_values()
+            result['verified'] = verified
+
+            changed = []
+            for idx in entries:
+                old_val = result['baseline'].get(idx)
+                new_val = verified.get(idx)
+                if old_val != new_val:
+                    changed.append(idx)
+                    _elog(f"  idx {idx} ({Od8Setting(idx).name}): "
+                          f"{old_val} -> {new_val}")
+            result['changed_indices'] = changed
+            _elog(f"apply_od_via_escape: verify OK, "
+                  f"{len(changed)}/{len(entries)} indices changed")
+        except (D3DKMTError, OSError) as e:
+            _elog(f"apply_od_via_escape: verify read failed (non-fatal): {e}")
+
+        result['ok'] = True
+
+    finally:
+        client.close()
+
+    return result
 
 
 def apply_od_settings(smu, virt, settings):

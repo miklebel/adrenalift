@@ -48,6 +48,7 @@ TABLE_OVERDRIVE            = 8
 TABLE_I2C_COMMANDS         = 9
 TABLE_DRIVER_INFO          = 10
 TABLE_ECCINFO              = 11  # ECC counters (RDNA3/RDNA4, smu14_driver_if_v14_0.h)
+TABLE_CUSTOM_SKUTABLE      = 12  # Soft PP / custom SKU table (Windows driver extension)
 
 
 # ---------------------------------------------------------------------------

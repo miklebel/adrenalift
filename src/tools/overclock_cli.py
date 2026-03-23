@@ -1,5 +1,5 @@
 """
-RDNA4 Overclock -- Kernel PPTable Patch + OD Apply (CLI)
+Adrenalift -- Kernel PPTable Patch + OD Apply (CLI)
 =========================================================
 
 CLI frontend for the overclock engine. Scans physical memory for
@@ -184,7 +184,7 @@ def print_verify_results(all_ok, overwritten, details, settings):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='RDNA4 Overclock - Kernel PPTable Patch',
+        description='Adrenalift - Kernel PPTable Patch',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -258,7 +258,7 @@ Examples:
     )
 
     print("=" * 62)
-    print("  RDNA4 Overclock -- Kernel PPTable Patch + OD Apply")
+    print("  Adrenalift -- Kernel PPTable Patch + OD Apply")
     print("=" * 62)
 
     if not args.scan_only and not args.list_clocks:

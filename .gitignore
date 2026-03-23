@@ -1,6 +1,6 @@
 *.pyc
 /bios
-*.json
 /build
 /dist
 /.cursor
+/src/tools/*

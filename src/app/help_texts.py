@@ -1,5 +1,5 @@
 """
-HTML help / cheatsheet strings for the overclock GUI.
+HTML help / cheatsheet strings for Adrenalift.
 
 Extracted from main.py to keep the UI module focused on layout and logic.
 """
@@ -7,115 +7,197 @@ Extracted from main.py to keep the UI module focused on layout and logic.
 from __future__ import annotations
 
 SIMPLE_HOW_IT_WORKS_HTML = """
-<h3>How PP Table RAM Patching Works</h3>
-<p>This tool uses a <b>multi-layer defense-in-depth</b> approach to keep your
-overclock settings alive despite the Windows AMD driver constantly trying to
-re-impose stock limits.</p>
+<h3>How Simple Apply Works</h3>
 
 <h4>The Problem</h4>
-<p>The AMD GPU driver keeps a cached copy of the <b>PowerPlay (PP) table</b>
-in system RAM. Whenever the driver re-evaluates power management &mdash;
-on workload changes, thermal events, display mode switches, AC/DC transitions
-&mdash; it reads from this cached table, derives the "allowed" clock and power
-limits, and sends them to the SMU firmware. This <b>overwrites any direct SMU
-commands</b> you may have sent.</p>
+<p>The AMD GPU driver keeps its own copy of the <b>PowerPlay (PP) table</b>
+in system RAM. This table contains the clock limits that the driver considers
+"allowed". Every time the driver re-evaluates power management &mdash;
+on workload changes, thermal events, display switches &mdash; it reads these
+limits and sends them to the GPU firmware (SMU). If you set clocks directly
+via SMU commands, the driver will eventually overwrite them with whatever is
+in its cached table.</p>
 
-<h4>Layer 1 &mdash; PP Table RAM Patch (this tool's scan &amp; patch)</h4>
-<p>Scans physical memory for the driver's cached PP table copies and overwrites
-clock limits (GameClockAc, BoostClockAc) and MsgLimits (PPT, TDC, temps)
-directly in RAM. This <b>poisons the driver's own data source</b> so that when
-the driver re-derives limits, it sends your higher values instead of stock.</p>
-<ul>
-  <li>Without the RAM patch, the driver would periodically re-send stock max
-      clocks to the SMU, undoing your overclock.</li>
-  <li>With it, the driver unknowingly enforces <i>your</i> limits every time
-      it re-evaluates.</li>
-</ul>
+<h4>What Apply Does</h4>
+<p>Apply performs three steps in order:</p>
 
-<h4>Layer 2 &mdash; Direct SMU Messages (sent at the same time)</h4>
-<p>After patching RAM, the tool sends SMU commands directly
-(<code>SetSoftMaxByFreq</code>, <code>SetHardMaxByFreq</code>,
-<code>SetPptLimit</code>, etc.). These take effect <b>immediately</b> on the
-SMU firmware, setting clocks and power limits right now &mdash; without waiting
-for the driver to re-evaluate.</p>
-<ul>
-  <li><b>Clock gating features</b> (DS_GFXCLK, GFX_ULV, GFXOFF) are disabled
-      via <code>DisableSmuFeaturesLow</code>.</li>
-  <li><code>DisallowGfxOff</code> prevents the GPU from entering sleep.</li>
-  <li>A workload-mask cycle (PowerSave &rarr; 3D Fullscreen) forces the SMU to
-      re-evaluate DPM with the new limits.</li>
-</ul>
+<ol>
+  <li><b>Patch the PP table in RAM.</b> During the earlier Scan step, this tool
+      found the physical memory addresses where the driver keeps its cached PP
+      table copies. Apply now overwrites the <b>GameClockAc</b> and
+      <b>BoostClockAc</b> fields at those addresses with your chosen clock value.
+      From this point on, when the driver reads its own table, it sees your value
+      instead of the stock one.</li>
 
-<h4>Layer 3 &mdash; OD Table (percentage-based, via SMU table transfer)</h4>
-<p>The OverDrive table sets percentage offsets (PPT%, TDC%, GfxclkFoffset) via
-the official <code>TransferTableDram2Smu</code> protocol. The SMU applies these
-on top of the base limits from the PP table &mdash; so the RAM patch and OD
-table multiply together.</p>
+  <li><b>DisallowGfxOff.</b> Sends a message to the SMU telling it not to put
+      the GPU into the GfxOff sleep state. This keeps the GPU awake so the new
+      clock values can take effect immediately.</li>
 
-<h4>Layer 4 &mdash; Registry Anti-Clock-Gating (persistent)</h4>
-<p>Registry patches disable the driver's own power management policies
-(ULPS, GPU power-down, UVD/VCE clock gating, ASPM, clock stretcher).
-Unlike RAM patches, these <b>survive reboots</b> and prevent the driver from
-re-enabling power-saving features at the driver policy level.</p>
+  <li><b>Workload mask cycle.</b> Switches the SMU workload profile briefly
+      (compute &rarr; 3D fullscreen), then back. This forces the driver to
+      re-read the PP table and re-derive its clock limits. Because we already
+      patched the table, the driver now sends <i>your</i> clock values to the
+      SMU as if they were the original ones.</li>
+</ol>
 
-<h4>Layer 5 &mdash; Watchdog (continuous enforcement)</h4>
-<p>The watchdog timer periodically re-sends min-frequency floors and feature
-disables to catch any driver re-enables that slip through.</p>
+<h4>Why This Works</h4>
+<p>The driver trusts its own cached PP table unconditionally. By changing the
+values in that table before the driver reads them, we make the driver enforce
+our overclock on our behalf. The workload mask cycle is the trigger that makes
+the driver re-read the table and push the new limits to the SMU right away,
+rather than waiting for a natural re-evaluation event.</p>
 
-<h4>Why All Layers Are Needed</h4>
-<table border="1" cellpadding="4" cellspacing="0">
-<tr><th>Mechanism</th><th>Purpose</th><th>Persistent?</th></tr>
-<tr><td>PP Table RAM Patch</td><td>Prevents driver from re-sending stock limits</td>
-    <td>Until reboot</td></tr>
-<tr><td>Direct SMU Messages</td><td>Immediately sets clocks/power/features</td>
-    <td>Until driver overrides</td></tr>
-<tr><td>OD Table Commit</td><td>Percentage offset on top of base limits</td>
-    <td>Until driver resets OD</td></tr>
-<tr><td>Registry Patches</td><td>Disables driver power management policies</td>
-    <td>Across reboots</td></tr>
-<tr><td>Watchdog</td><td>Re-enforces floor periodically</td>
-    <td>While app is running</td></tr>
-</table>
-
-<p><b>Bottom line:</b> SMU messages alone are not enough because the driver will
-overwrite them. The PP table RAM patch ensures the driver works <i>for</i> you
-rather than <i>against</i> you. Both are needed for a robust overclock.</p>
+<p><b>No direct frequency commands</b> (SetSoftMax, SetHardMax, etc.) are sent
+in this mode &mdash; the driver itself handles all SMU frequency programming
+using the patched table values.</p>
 """
 
 PP_HELP_HTML = """
-<h3>PP &mdash; PowerPlay Table RAM Patching</h3>
-<p>The PP tab patches the driver&rsquo;s in-memory copies of the
-<b>PowerPlay (PP) table</b> at physical addresses discovered by <b>Scan</b>.
-This directly changes the limits the driver reads when configuring the GPU.</p>
+<h3>PP &mdash; PowerPlay Table (Full Field Editor)</h3>
+<p>The PP tab exposes <b>every field</b> in the GPU's PowerPlay (PP) table as an
+editable tree. The PP table is a binary structure baked into the VBIOS ROM that
+contains all of the driver's clock limits, power limits, temperature limits,
+voltage curves, fan curves, and feature flags. At driver load time, the AMD
+driver copies this table from the VBIOS into <b>system RAM</b> and consults it
+whenever it needs to re-evaluate power management. This tab lets you view and
+overwrite any field in that RAM copy.</p>
 
-<h4>Clocks &amp; Power rows</h4>
-<p>For clock and power-limit rows (Game Clock, Boost Clock, PPT, TDC, etc.),
-Apply PP does <b>two things</b>:</p>
+<h4>How the tree is built</h4>
+<p>On startup the tool reads the VBIOS ROM and decodes the PP table using the
+UPP library. Every decoded field is shown in a hierarchical tree matching the
+struct layout: <code>smc_pptable &rarr; SkuTable</code>,
+<code>CustomSkuTable</code>, <code>BoardTable</code>, etc. If UPP is
+unavailable or the ROM cannot be decoded, a <b>fallback flat list</b> with the
+most important fields (GameClock, BoostClock, PPT, TDC, temperatures) is shown
+instead.</p>
+
+<h4>Tree columns</h4>
+<ul>
+  <li><b>Field</b> &mdash; Struct field name from the PP table layout
+      (e.g. <code>GameClockAc</code>, <code>SocketPowerLimitAc</code>).</li>
+  <li><b>VBIOS value</b> &mdash; The stock value read from the VBIOS ROM.
+      This never changes and serves as your reference for the factory setting.</li>
+  <li><b>Current value</b> &mdash; The value currently in the driver's RAM copy.
+      Updated when you click <b>Refresh</b>. Starts as &ldquo;---&rdquo; until
+      the first refresh completes. For a few key fields (GameClockAc, PPT,
+      Temperature) this column can also show live SMU telemetry.</li>
+  <li><b>Custom input</b> &mdash; Editable spinbox where you enter your desired
+      value. Initialised to the VBIOS value. The spinbox range is derived from
+      the field's data type (uint8 &rarr; 0&ndash;255, uint16 &rarr;
+      0&ndash;65535, uint32 &rarr; 0&ndash;2 billion). Units (MHz, W, A,
+      &deg;C, mV, RPM) are inferred from the field name.</li>
+  <li><b>Set</b> &mdash; Per-field apply button. Patches <i>only this one
+      field</i> across all valid PP table addresses in RAM. Uses the correct
+      write width (1, 2, or 4 bytes) based on the field's struct type.</li>
+</ul>
+
+<h4>Key field groups</h4>
+<ul>
+  <li><b>DriverReportedClocks</b> &mdash; <code>GameClockAc</code> and
+      <code>BoostClockAc</code>. These are the primary clock limits the driver
+      reports to the SMU. Patching them is the core of the Simple Apply
+      overclock.</li>
+  <li><b>MsgLimits &rarr; Power</b> &mdash; <code>SocketPowerLimitAc/Dc</code>
+      (PPT limits in watts). Controls how much total board power the driver
+      allows before asking the SMU to throttle.</li>
+  <li><b>MsgLimits &rarr; Temperature</b> &mdash; Per-sensor thermal limits
+      (Edge, Hotspot, Memory, VR GFX, VR SOC). Lowering these makes the driver
+      throttle sooner; raising them gives more thermal headroom.</li>
+  <li><b>MsgLimits &rarr; Current</b> &mdash; TDC (Thermal Design Current)
+      limits in amps for GFX and SOC rails.</li>
+  <li><b>FreqTableGfxclk / FreqTableUclk / FreqTableFclk</b> &mdash; DPM
+      frequency tables. Each entry is a clock speed for one DPM level.</li>
+  <li><b>CustomSkuTable</b> &mdash; Fan curves, acoustic limits, zero-RPM
+      settings, advanced voltage/clock overrides.</li>
+  <li><b>BoardTable</b> &mdash; Board-level power delivery parameters,
+      VRM current limits, voltage regulator thermal limits.</li>
+</ul>
+
+<h4>Apply PP (bulk write)</h4>
+<p>Clicking <b>Apply PP</b> reads every spinbox value in the tree and writes all
+of them to the driver's RAM copy at every scanned PP table address. This is a
+<b>RAM-only operation</b> &mdash; no SMU messages are sent. The write uses each
+field's decoded byte offset and data type, so 8-bit, 16-bit, and 32-bit fields
+are all patched correctly. Each write is verified by reading back the patched
+value.</p>
+
+<h4>Per-field Set (single write)</h4>
+<p>Each row's <b>Set</b> button patches just that one field. Useful for testing
+a single change without touching anything else. The button only appears for
+fields that have a known RAM offset.</p>
+
+<h4>Refresh</h4>
+<p>Clicking <b>Refresh</b> triggers a background worker that:</p>
 <ol>
-  <li><b>RAM patch</b> &mdash; overwrites the field in every discovered PP table
-      copy so the driver sees your value.</li>
-  <li><b>SMU commands</b> &mdash; sends <code>SetSoftMinByFreq</code>,
-      <code>SetSoftMaxByFreq</code>, <code>SetHardMinByFreq</code>,
-      <code>SetHardMaxByFreq</code>, <code>DisallowGfxOff</code>, and
-      workload-mask cycling to the SMU so the firmware enforces the new
-      limits immediately.</li>
+  <li>Reads the PP table bytes from the first valid physical address and
+      extracts every field value using the offset map (updates the
+      <b>Current value</b> column).</li>
+  <li>Reads the OD table from the SMU (updates OD-linked fields).</li>
+  <li>Reads SMU metrics (updates live clock, PPT, temperature for key
+      fields).</li>
+  <li>Queries full SMU state (DPM frequencies, voltage, features).</li>
 </ol>
 
-<h4>MsgLimits rows</h4>
-<p>For power-limit fields (PPT), Apply PP also sends
-<code>SetPptLimit</code> to the SMU in addition to the RAM patch.</p>
+<h4>Prerequisite: Scan</h4>
+<p>Before any PP patching can work, the main Scan must have found at least one
+valid PP table address in physical memory. If no addresses were found, Apply PP
+will report &ldquo;no valid addresses to patch&rdquo;. Per-field Set buttons
+still appear but will return an error. The scan searches system RAM for byte
+patterns matching the VBIOS PP table fingerprint and validates candidates
+against known structure offsets.</p>
 
-<h4>Custom PP fields (fan, voltage, freq, board)</h4>
-<p>Rows in the lower &ldquo;custom&rdquo; section are <b>RAM-only</b>: they
-patch the PP table bytes in driver memory but do <i>not</i> send any SMU
-commands. The driver picks up the new values on its next read of the table.</p>
+<h4>PP vs. OD vs. Simple</h4>
+<table border="1" cellpadding="4" cellspacing="0">
+  <tr><th></th><th>PP Tab</th><th>OD Tab</th><th>Simple Tab</th></tr>
+  <tr><td>Mechanism</td><td>Direct RAM overwrite</td>
+      <td>SMU table transfer</td><td>RAM overwrite + SMU workload cycle</td></tr>
+  <tr><td>Scope</td><td>Any PP table field</td>
+      <td>OD parameters only</td><td>Clock + PPT + temps</td></tr>
+  <tr><td>SMU involved?</td><td>No</td><td>Yes</td><td>Yes (workload mask)</td></tr>
+  <tr><td>Admin required?</td><td>Yes (physical memory)</td>
+      <td>Yes (MMIO)</td><td>Yes</td></tr>
+  <tr><td>Takes effect</td><td>Next driver re-evaluation</td>
+      <td>Immediately</td><td>Immediately (forced re-eval)</td></tr>
+</table>
 
-<h4>Prerequisites &amp; Volatility</h4>
+<h4>Why change fields beyond clocks?</h4>
 <ul>
-  <li>A successful <b>Scan</b> is required before Apply PP can locate the PP
-      table copies in physical memory.</li>
+  <li><b>Raise PPT</b> to give the GPU more power budget before throttling.</li>
+  <li><b>Raise temperature limits</b> to prevent premature thermal throttling
+      (monitor temps!).</li>
+  <li><b>Raise TDC</b> to allow higher sustained current draw.</li>
+  <li><b>Edit fan curves</b> so the driver's built-in fan controller uses more
+      aggressive cooling.</li>
+  <li><b>Modify DPM frequency tables</b> to change the clock steps the driver
+      programs into the SMU.</li>
+  <li><b>Flip feature bits</b> in the PP header to unlock OD features the VBIOS
+      disables.</li>
+</ul>
+
+<h4>Caveats</h4>
+<ul>
   <li>All changes are <b>volatile</b> &mdash; lost on reboot, driver reload, or
       GPU reset.</li>
+  <li>PP patching modifies the driver's <i>cached copy</i> in RAM, not the
+      VBIOS ROM. The original VBIOS is never touched.</li>
+  <li>Changes do not take effect instantly. The driver must <b>re-read</b> the
+      patched table (via a workload transition, display mode switch, or thermal
+      event) before the new values reach the SMU. Use the Simple tab's workload
+      cycle or OD apply to force an immediate re-evaluation.</li>
+  <li>Padding, Spare, and Reserve fields are automatically hidden from the tree
+      to reduce clutter.</li>
+  <li>If the VBIOS cannot be decoded (no UPP library, unsupported GPU
+      generation), the fallback flat list only covers clocks, PPT, TDC, and
+      temperatures. Full-tree mode requires the UPP library and a supported
+      RDNA3/4 PP table layout.</li>
+  <li>Per-field Set buttons only appear for fields with a known byte offset.
+      Computed or virtual fields (like smu_key-mapped fields) cannot be patched
+      individually.</li>
+  <li>Setting values outside the hardware's safe operating range can cause
+      instability, crashes, or thermal damage. Always verify changes with the
+      Metrics tab.</li>
+  <li>Multiple RAM copies of the PP table may exist (one per driver context).
+      All copies found by Scan are patched simultaneously.</li>
 </ul>
 """
 
@@ -519,10 +601,10 @@ hardware feature. This tab gives you granular control over every individual bit.
 </ul>
 """
 
-TABLES_CHEATSHEET = """
-<h3>Tables — Live metrics &amp; raw SMU table dumps</h3>
-<p>This tab reads raw data tables from the SMU's DMA buffer. The top section shows
-parsed live performance metrics; the bottom section lets you dump raw tables as hex.</p>
+METRICS_CHEATSHEET = """
+<h3>Metrics — Live SMU performance telemetry</h3>
+<p>This tab reads the <code>SmuMetrics_t</code> struct from the SMU's DMA buffer and
+displays every field as a live, refreshable table.</p>
 
 <h4>All metrics sections</h4>
 <p>The metrics table is organized into sections. Every field from the
@@ -659,6 +741,34 @@ parsed live performance metrics; the bottom section lets you dump raw tables as 
   <li><b>PublicSerialNumberLower / Upper</b> — GPU die serial number (two 32-bit halves).</li>
 </ul>
 
+<h4>UI controls</h4>
+<ul>
+  <li><b>Refresh Now</b> — One-shot read of the full SmuMetrics_t struct.</li>
+  <li><b>Auto-refresh checkbox</b> — Enables a periodic timer.</li>
+  <li><b>Interval spinbox (1–30 s)</b> — Sets the auto-refresh period. Adjustable while
+      auto-refresh is running.</li>
+  <li><b>Status label</b> — Shows last update timestamp and value count, or error text.</li>
+</ul>
+
+<h4>Caveats</h4>
+<ul>
+  <li>Metrics are sampled by the SMU firmware at its own internal rate, not at your refresh
+      interval. Polling faster than ~2 s adds MMIO overhead with diminishing returns.</li>
+  <li>Some metric values are <i>averaged</i> over the SMU's sampling window, not
+      instantaneous snapshots. "Pre/PostDs" frequency differences reveal deep-sleep
+      duty cycle, not instantaneous jitter.</li>
+  <li>D3Hot counters and APU/STAPM fields are typically zero on desktop GPUs.</li>
+  <li>Throttler names (Temp_Edge, PPT0, TDC_GFX, etc.) are from the SMU v14.0 firmware
+      header (smu14_driver_if_v14_0.h). Values are 0-100% activity percentage.</li>
+  <li>PublicSerialNumber fields may be zero if the GPU vendor has not programmed a serial.</li>
+</ul>
+"""
+
+TABLES_CHEATSHEET = """
+<h3>Tables — Raw SMU table dumps &amp; PFE settings</h3>
+<p>This tab reads raw data tables from the SMU's DMA buffer as hex dumps, and provides
+controls for reading and patching PFE (PPTable header) settings.</p>
+
 <h4>Other Tables (on demand)</h4>
 <ul>
   <li><b>Read PPTable</b> (table id 0) — Raw hex dump of the power-play table stored in SMU
@@ -670,32 +780,44 @@ parsed live performance metrics; the bottom section lets you dump raw tables as 
       correctable/uncorrectable error counts per memory partition.</li>
 </ul>
 
+<h4>PFE Settings (PPTable Header)</h4>
+<p>The PFE (PowerPlay Feature Enable) section reads and patches fields in the PPTable
+header stored in SMU SRAM: <code>FeaturesToRun</code>, <code>FwDStateMask</code>, and
+<code>DebugOverrides</code>.</p>
+<ul>
+  <li><b>Read PFE Settings</b> — Reads the current PFE_Settings_t from TABLE_PPTABLE and
+      displays FeaturesToRun, FwDStateMask, and DebugOverrides.</li>
+  <li><b>Patch FeaturesToRun</b> — Adds GFX_EDC (41), CLOCK_POWER_DOWN_BYPASS (43),
+      EDC_PWRBRK (49) to FeaturesToRun and writes back via TransferTableDram2Smu.</li>
+  <li><b>Patch DebugOverrides</b> — Sets DISABLE_FMAX_VMAX (0x40) and
+      ENABLE_PROFILING_MODE (0x1000) in DebugOverrides and writes back.</li>
+  <li><b>Check OD Memory Caps</b> — Checks ODCAP bits 4 (AUTO_OC_MEMORY),
+      5 (MEMORY_TIMING_TUNE), 6 (MANUAL_AC_TIMING) and UCLK OD support.</li>
+</ul>
+
+<h4>Tools DRAM Path (msg 0x53)</h4>
+<p>The "Tools Path" buttons perform the same patches as their counterparts above but
+write via <code>TransferTableDram2SmuWithAddr</code> (msg 0x53) instead of the standard
+msg 0x13. This bypasses driver-path rejection for table writes. Falls back to
+TABLE_CUSTOM_SKUTABLE (id=12) if TABLE_PPTABLE fails.</p>
+
 <h4>UI controls</h4>
 <ul>
-  <li><b>Refresh Now</b> — One-shot read of the full SmuMetrics_t struct.</li>
-  <li><b>Auto-refresh checkbox</b> — Enables a periodic timer.</li>
-  <li><b>Interval spinbox (1–30 s)</b> — Sets the auto-refresh period. Adjustable while
-      auto-refresh is running.</li>
-  <li><b>Status label</b> — Shows last update timestamp and value count, or error text.</li>
-  <li><b>Hex view</b> (bottom) — Read-only text area displaying raw hex dumps from the
-      "Other Tables" buttons.</li>
+  <li><b>Hex view</b> — Read-only text area displaying raw hex dumps from the table-read
+      buttons.</li>
+  <li><b>PFE result view</b> — Read-only text area showing PFE read/patch results.</li>
 </ul>
 
 <h4>Caveats</h4>
 <ul>
-  <li>Metrics are sampled by the SMU firmware at its own internal rate, not at your refresh
-      interval. Polling faster than ~2 s adds MMIO overhead with diminishing returns.</li>
-  <li>Some metric values are <i>averaged</i> over the SMU's sampling window, not
-      instantaneous snapshots. "Pre/PostDs" frequency differences reveal deep-sleep
-      duty cycle, not instantaneous jitter.</li>
   <li>Raw table hex dumps require knowledge of the struct layout to interpret. The PPTable
       format is GPU-generation-specific.</li>
   <li>Reading tables while the GPU is under heavy load may briefly stall the SMU command
       interface.</li>
-  <li>D3Hot counters and APU/STAPM fields are typically zero on desktop GPUs.</li>
-  <li>Throttler names (Temp_Edge, PPT0, TDC_GFX, etc.) are from the SMU v14.0 firmware
-      header (smu14_driver_if_v14_0.h). Values are 0-100% activity percentage.</li>
-  <li>PublicSerialNumber fields may be zero if the GPU vendor has not programmed a serial.</li>
+  <li>PFE patches modify the SMU's in-SRAM copy of the PPTable header. Changes are
+      <b>volatile</b> — lost on reboot, driver reload, or GPU reset.</li>
+  <li>The Tools DRAM Path (msg 0x53) is an undocumented SMU message. It may not be
+      available on all firmware versions.</li>
 </ul>
 """
 
@@ -801,34 +923,271 @@ current registry value so you can tweak them manually.</p>
 </ul>
 """
 
-DIAG_VRAM_DUMP_HTML = """
-<h3>VRAM Dump — Full BAR Snapshot</h3>
-<p>This tool reads the entire GPU VRAM BAR (Base Address Register) aperture through
-physical memory mapping and saves it as a <b>gzip-compressed</b> <code>.bin.gz</code>
-file. A small JSON sidecar (<code>.meta.json</code>) is written alongside with
-hardware metadata.</p>
+THROTTLERS_CHEATSHEET = """
+<h3>Throttlers — Per-Bit Throttler Diagnostics &amp; Mask Control</h3>
+<p>The SMU firmware enforces <b>21 independent throttlers</b>, each tied to a
+specific hardware limit (temperature sensor, current rail, power budget, or
+reliability model). When a throttler fires it forces clocks down until the
+monitored quantity drops below its threshold. The <b>Live %</b> column shows
+how aggressively each throttler is currently reducing clocks (0&nbsp;=&nbsp;not
+firing, 100&nbsp;=&nbsp;maximum throttle).</p>
 
-<h4>What gets captured</h4>
+<h4>Bit Map</h4>
+<table border="1" cellpadding="4" cellspacing="0">
+  <tr><th>Bit</th><th>Category</th><th>Name</th></tr>
+  <tr><td>0</td><td>Thermal</td><td>Temp_Edge</td></tr>
+  <tr><td>1</td><td>Thermal</td><td>Temp_Hotspot</td></tr>
+  <tr><td>2</td><td>Thermal</td><td>Temp_Hotspot_GFX</td></tr>
+  <tr><td>3</td><td>Thermal</td><td>Temp_Hotspot_SOC</td></tr>
+  <tr><td>4</td><td style="color:#d80;">Thermal (MEM)</td><td>Temp_Mem</td></tr>
+  <tr><td>5</td><td>VR Thermal</td><td>Temp_VR_GFX</td></tr>
+  <tr><td>6</td><td>VR Thermal</td><td>Temp_VR_SOC</td></tr>
+  <tr><td>7</td><td style="color:#d80;">VR Thermal (MEM)</td><td>Temp_VR_Mem0</td></tr>
+  <tr><td>8</td><td style="color:#d80;">VR Thermal (MEM)</td><td>Temp_VR_Mem1</td></tr>
+  <tr><td>9</td><td>Thermal</td><td>Temp_Liquid0</td></tr>
+  <tr><td>10</td><td>Thermal</td><td>Temp_Liquid1</td></tr>
+  <tr><td>11</td><td>Thermal</td><td>Temp_PLX</td></tr>
+  <tr><td>12</td><td>Current</td><td>TDC_GFX</td></tr>
+  <tr><td>13</td><td>Current</td><td>TDC_SOC</td></tr>
+  <tr><td>14</td><td>Power</td><td>PPT0</td></tr>
+  <tr><td>15</td><td>Power</td><td>PPT1</td></tr>
+  <tr><td>16</td><td>Power</td><td>PPT2</td></tr>
+  <tr><td>17</td><td>Power</td><td>PPT3</td></tr>
+  <tr><td>18</td><td style="color:#c00;">Reliability</td><td>FIT</td></tr>
+  <tr><td>19</td><td>Other</td><td>GFX_APCC_Plus</td></tr>
+  <tr><td>20</td><td>Other</td><td>GFX_DVO</td></tr>
+</table>
+
+<h4>Per-Throttler Descriptions</h4>
+
+<p><b>Thermal throttlers (bits 0–4, 9–11):</b></p>
 <ul>
-  <li>The driver's cached <b>PPTable</b> copies</li>
-  <li><b>SMU metrics</b> data (two fresh transfers are triggered before the dump)</li>
-  <li>The <b>DMA buffer</b> used for SMU table transfers</li>
-  <li>Any other data visible in the BAR aperture</li>
+  <li><b>0 — Temp_Edge</b> — Die-edge temperature sensor. Fires when the edge
+      temperature approaches the VBIOS thermal limit (~100&nbsp;&deg;C typical).
+      Edge temp is usually the lowest reading; if this fires, the GPU is very
+      hot.</li>
+  <li><b>1 — Temp_Hotspot</b> — Peak junction (hotspot) temperature. The single
+      hottest point on the die. This is the primary thermal limiter on most GPUs
+      and the first throttler to fire under heavy load.</li>
+  <li><b>2 — Temp_Hotspot_GFX</b> — Hotspot temperature specific to the GFX
+      (shader/compute) domain. Fires when the graphics engine area exceeds its
+      thermal limit.</li>
+  <li><b>3 — Temp_Hotspot_SOC</b> — Hotspot temperature for the SoC domain
+      (memory controllers, display engine, media engines). Usually cooler than
+      GFX.</li>
+  <li><b>4 — Temp_Mem</b> — <span style="color:#d80;"><b>VRAM temperature
+      (memory-related).</b></span> Fires when GDDR6/GDDR6X memory modules exceed
+      their thermal limit. Common on cards with poor memory cooling or high
+      ambient temperatures. Disabling is relatively safe if you monitor VRAM
+      temps externally.</li>
+  <li><b>9 — Temp_Liquid0</b> — Liquid cooling loop temperature sensor 0.
+      Only active on cards with liquid cooling connectors or AIO coolers.</li>
+  <li><b>10 — Temp_Liquid1</b> — Liquid cooling loop temperature sensor 1
+      (secondary loop, if present).</li>
+  <li><b>11 — Temp_PLX</b> — PLX/PCIe bridge chip temperature. Only relevant on
+      multi-GPU boards with a PLX switch. Reports 0 on most single-GPU cards.</li>
 </ul>
 
-<h4>When to use</h4>
+<p><b>VR thermal throttlers (bits 5–8):</b></p>
 <ul>
-  <li><b>ReBAR debugging</b> &mdash; verify the full BAR is accessible and readable</li>
-  <li><b>Developer diagnostics</b> &mdash; send the .bin.gz + .meta.json to the developer
-      for offline analysis when something isn't working</li>
-  <li><b>Before/after comparison</b> &mdash; dump before and after applying patches to
-      verify changes in the BAR</li>
+  <li><b>5 — Temp_VR_GFX</b> — Voltage regulator temperature for the GFX core
+      power rail. Fires when the VRM MOSFETs powering the GPU core overheat.
+      Indicates inadequate VRM cooling or excessive power draw.</li>
+  <li><b>6 — Temp_VR_SOC</b> — Voltage regulator temperature for the SoC rail.
+      Typically runs cooler than the GFX VRM.</li>
+  <li><b>7 — Temp_VR_Mem0</b> — <span style="color:#d80;"><b>Memory VRM
+      temperature, channel 0 (memory-related).</b></span> Fires when the voltage
+      regulator feeding VRAM channel 0 overheats.</li>
+  <li><b>8 — Temp_VR_Mem1</b> — <span style="color:#d80;"><b>Memory VRM
+      temperature, channel 1 (memory-related).</b></span> Same as above for the
+      second memory channel.</li>
 </ul>
 
-<h4>Output files</h4>
+<p><b>Current throttlers (bits 12–13):</b></p>
 <ul>
-  <li><code>vram_dump.bin.gz</code> &mdash; Gzip-compressed raw BAR content</li>
-  <li><code>vram_dump.meta.json</code> &mdash; JSON with BAR size, addresses, SMU version,
-      MMHUB register values, timing, and compressed size</li>
+  <li><b>12 — TDC_GFX</b> — Thermal Design Current for the GFX rail. Fires when
+      the sustained current draw approaches the VRM's rated continuous current
+      capacity. Distinct from EDC (which is instantaneous spikes).</li>
+  <li><b>13 — TDC_SOC</b> — Thermal Design Current for the SoC rail. Usually has
+      generous headroom on desktop GPUs.</li>
 </ul>
+
+<p><b>Power throttlers (bits 14–17):</b></p>
+<ul>
+  <li><b>14 — PPT0</b> — Package Power Tracking limit 0 (primary). This is the
+      main total-board-power cap. When total power draw reaches the PPT0 limit
+      the SMU throttles all clocks to stay within budget. The most common
+      throttler under sustained heavy load.</li>
+  <li><b>15 — PPT1</b> — PPT limit 1 (secondary). A second power budget tier,
+      sometimes used for a tighter short-duration power cap.</li>
+  <li><b>16 — PPT2</b> — PPT limit 2 (tertiary). Rarely active on consumer
+      GPUs.</li>
+  <li><b>17 — PPT3</b> — PPT limit 3 (quaternary). Typically unused on desktop
+      RDNA cards.</li>
+</ul>
+
+<p><b>Reliability throttler (bit 18):</b></p>
+<ul>
+  <li><b>18 — FIT</b> — <span style="color:#c00;"><b>Failure-In-Time /
+      reliability throttling. Key suspect for unexplained VRAM clock
+      drops.</b></span> The SMU maintains an internal electromigration and
+      reliability model. When the firmware estimates that sustained
+      voltage&times;frequency operation is degrading the chip's projected
+      lifespan, FIT throttling reduces clocks proactively — even when
+      temperatures, power, and current are all within normal limits. This is the
+      most common cause of &ldquo;phantom&rdquo; throttling where clocks drop
+      for no visible reason. <b>Disabling FIT is the single most useful
+      diagnostic step</b> when investigating unexplained clock drops.</li>
+</ul>
+
+<p><b>Other throttlers (bits 19–20):</b></p>
+<ul>
+  <li><b>19 — GFX_APCC_Plus</b> — Adaptive Power Control Circuit Plus. A
+      firmware-driven power optimization that dynamically adjusts voltage and
+      frequency based on real-time power telemetry. Can cause minor clock
+      fluctuations under variable workloads.</li>
+  <li><b>20 — GFX_DVO</b> — Digital Voltage Optimizer. Adjusts voltage in
+      real-time based on silicon-specific characterization data. Firing
+      indicates the DVO is actively pulling voltage/frequency down for
+      efficiency or reliability.</li>
+</ul>
+
+<p><b>Additional read-only metric:</b></p>
+<ul>
+  <li><b>VmaxThrottlingPercentage</b> — How much the maximum-voltage limiter is
+      restricting clocks (0–100%). Shown as a read-only row at the bottom.
+      Non-zero indicates the GPU is hitting its voltage ceiling and cannot clock
+      higher even if other limits allow it.</li>
+</ul>
+
+<h4>SetThrottlerMask (SMU message 0x3A)</h4>
+<p>The <code>SetThrottlerMask</code> SMU message takes a 21-bit bitmask where
+each <b>set</b> bit means that throttler is <b>enabled</b> (allowed to fire).
+Clearing a bit disables the corresponding throttler at the firmware level.</p>
+<ul>
+  <li>Full mask: <code>0x1FFFFF</code> (all 21 throttlers enabled — stock
+      behavior).</li>
+  <li>Zero mask: <code>0x000000</code> (all throttlers disabled — no protection
+      whatsoever).</li>
+</ul>
+<p>This is a <b>runtime override only</b> — it resets on driver reload, GPU
+reset, or system reboot. It does not persist.</p>
+
+<h4>Memory-Related Throttlers (Bits 4, 7, 8)</h4>
+<p>Three throttlers are directly tied to VRAM thermal limits:</p>
+<ul>
+  <li><b>Bit 4 (Temp_Mem)</b> — GDDR temperature sensor on the memory modules
+      themselves.</li>
+  <li><b>Bit 7 (Temp_VR_Mem0)</b> — VRM temperature for memory power channel 0.</li>
+  <li><b>Bit 8 (Temp_VR_Mem1)</b> — VRM temperature for memory power channel 1.</li>
+</ul>
+<p>These are highlighted in the table. Disabling them is useful for diagnosing
+whether VRAM thermal limits are causing UCLK drops, but you should
+<b>monitor VRAM temperatures externally</b> (via the Tables/metrics tab)
+while they are disabled.</p>
+
+<h4>Table Columns</h4>
+<ul>
+  <li><b>Bit</b> — Bit position in the 21-bit throttler mask (0–20).</li>
+  <li><b>Name</b> — Human-readable throttler name from the SMU firmware
+      header.</li>
+  <li><b>Category</b> — Grouping: Thermal, VR Thermal, Current, Power,
+      Reliability, or Other. Color-coded for quick scanning.</li>
+  <li><b>Live %</b> — Current throttling percentage (0–100) from the latest
+      metrics read. <b style="color:#ff4444;">Bold red</b> when non-zero
+      (throttler is actively firing).</li>
+  <li><b>Enabled</b> — Whether this throttler is currently enabled in the
+      mask (ON/OFF).</li>
+  <li><b>Toggle</b> — Checkbox to include/exclude this throttler when applying
+      a new mask.</li>
+  <li><b>Set</b> — Per-row apply button (or use the "Apply Mask" button at the
+      bottom to send all toggles at once).</li>
+</ul>
+
+<h4>Quick Actions</h4>
+<ul>
+  <li><b>Apply Mask</b> — Reads all 21 checkboxes, computes the bitmask, and
+      sends <code>SetThrottlerMask</code>.</li>
+  <li><b>Disable Mem Throttlers</b> — Clears bits 4, 7, 8 and applies. Safe
+      first step for diagnosing VRAM clock drops.</li>
+  <li><b>Disable FIT</b> — Clears bit 18 and applies. The single most useful
+      button for investigating phantom throttling.</li>
+  <li><b>Disable All</b> — Sends mask&nbsp;=&nbsp;0x0. Removes all
+      protection — use only for short diagnostic sessions with temperature
+      monitoring.</li>
+  <li><b>Enable All</b> — Sends mask&nbsp;=&nbsp;0x1FFFFF. Restores stock
+      behavior.</li>
+  <li><b>Refresh</b> — Triggers a metrics read to update the Live % column.</li>
+</ul>
+
+<h4>Safety Warnings</h4>
+<ul>
+  <li><span style="color:#c00;"><b>Disabling thermal throttlers (bits 0–11)
+      removes hardware thermal protection.</b></span> The GPU, VRMs, or VRAM can
+      physically overheat and sustain permanent damage under sustained load
+      without these safeguards. Always monitor temperatures via the Tables tab
+      while thermal throttlers are disabled.</li>
+  <li><span style="color:#c00;"><b>Disabling all throttlers (mask&nbsp;=&nbsp;0x0)
+      is extremely aggressive.</b></span> Use only for short diagnostic sessions.
+      Never leave it applied during unattended workloads.</li>
+  <li><b>FIT (bit 18) and memory throttlers (bits 4, 7, 8) are the safest to
+      disable</b> for testing purposes. FIT protects long-term reliability (not
+      immediate safety), and memory thermal limits have generous margins on most
+      desktop cards with adequate cooling.</li>
+  <li>Power throttlers (PPT0–PPT3) protect the VRM from exceeding its power
+      delivery rating. Disabling them may cause VRM overheating or instability
+      under extreme power draw.</li>
+  <li>Current throttlers (TDC_GFX, TDC_SOC) protect against sustained
+      overcurrent. Disabling them risks VRM damage under prolonged heavy load.</li>
+  <li>All changes are <b>volatile</b> — they reset on driver reload, GPU reset,
+      or system reboot. No permanent damage to firmware settings is possible
+      from <code>SetThrottlerMask</code> alone.</li>
+</ul>
+"""
+
+ESCAPE_OD_HELP_HTML = """
+<h3>Escape OD &mdash; D3DKMTEscape OD8 Write</h3>
+<p>This tab sends <b>OD8 settings</b> to the GPU driver via the
+<code>D3DKMTEscape</code> WDDM interface &mdash; the same mechanism AMD
+Adrenalin uses at runtime.  <b>No admin privileges</b> are required.</p>
+
+<h4>How it differs from the OD (SMU) tab</h4>
+<table border="1" cellpadding="4" cellspacing="0">
+  <tr><th></th><th>OD (SMU) Tab</th><th>Escape OD Tab</th></tr>
+  <tr><td>Transport</td><td>DMA + SMU mailbox</td><td>D3DKMTEscape IOCTL</td></tr>
+  <tr><td>Admin required?</td><td>Yes</td><td><b>No</b></td></tr>
+  <tr><td>Scope</td><td>Full OD table + SMU cmds</td><td>OD8 indices only</td></tr>
+  <tr><td>Protocol</td><td>TABLE_OVERDRIVE write</td><td>0x00C000A1 v2 escape</td></tr>
+</table>
+
+<h4>How targeting works</h4>
+<p>The OD8 escape uses a <b>73-entry indexed array</b> (indices 0&ndash;72).
+Each entry carries a <code>(value, is_set)</code> pair.  Setting
+<code>is_set=1</code> tells the driver to apply that index;
+<code>is_set=0</code> means skip.  This lets you target <b>any individual
+index or combination</b> in a single escape call.</p>
+
+<p>Click <b>Read</b> to fetch all 73 current values from the driver.
+Use a per-row <b>Set</b> button to write one index, or
+<b>Apply All Modified</b> to write every row whose input differs from the
+current driver value.</p>
+
+<h4>Confidence tags</h4>
+<ul>
+  <li><b>[F]</b> Frida-confirmed &mdash; captured from live Adrenalin traffic,
+      ground truth.</li>
+  <li><b>[G]</b> Ghidra-confirmed &mdash; found in decompiled driver handler
+      code.</li>
+  <li><b>[I]</b> Inferred &mdash; structural analysis + Linux kernel
+      cross-reference; less certain.</li>
+</ul>
+
+<h4>Volatility</h4>
+<p>All OD8 changes are <b>volatile</b> &mdash; lost on reboot or driver
+reload, just like the OD (SMU) tab.</p>
+
+<h4>Reset to Defaults</h4>
+<p>The <b>Reset</b> button sends index 71 (ResetFlag) with value&nbsp;1.
+The driver treats this as a signal to revert all OD settings to their
+power-on defaults.</p>
 """

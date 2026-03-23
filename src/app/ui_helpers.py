@@ -1,4 +1,4 @@
-"""UI helper factory functions for the RDNA4 Overclock GUI.
+"""UI helper factory functions for Adrenalift.
 
 Centralises repeated widget-creation patterns from main.py into reusable
 factory functions, reducing boilerplate across tabs.

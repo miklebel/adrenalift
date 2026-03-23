@@ -27,6 +27,7 @@ Requirements:
 """
 
 import logging
+import threading
 import time
 
 from src.io.mmio import WinRing0, GpuMMIO, InpOut32
@@ -52,12 +53,14 @@ SMU_RESP_OK      = 0x01  # Command succeeded
 SMU_RESP_FAIL    = 0xFF  # Command failed
 SMU_RESP_UNKNOWN = 0xFE  # Unknown / unsupported command
 SMU_RESP_BUSY    = 0xFC  # SMU is busy (some firmware versions)
+SMU_RESP_PREREQ  = 0xFD  # Prerequisite not met (e.g. feature not in allowed mask)
 
 _RESP_NAMES = {
     SMU_RESP_NONE:    "NO_RESPONSE",
     SMU_RESP_OK:      "OK",
     SMU_RESP_FAIL:    "FAIL",
     SMU_RESP_UNKNOWN: "UNKNOWN_CMD",
+    SMU_RESP_PREREQ:  "PREREQ_FAILED",
     SMU_RESP_BUSY:    "BUSY",
 }
 
@@ -304,6 +307,15 @@ _FEATURE_NAMES_LOW = _FEATURE_NAMES
 
 
 # ---------------------------------------------------------------------------
+# Global SMU mailbox lock -- the C2PMSG registers (MSG, PARAM, RESP) are a
+# single shared mailbox.  Concurrent send_msg calls from different threads
+# interleave the 5-step protocol and corrupt each other's transactions,
+# producing UNKNOWN_CMD / FAIL / garbled return values.
+# ---------------------------------------------------------------------------
+
+_smu_mailbox_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
 # SmuCmd Class
 # ---------------------------------------------------------------------------
 
@@ -378,43 +390,44 @@ class SmuCmd:
 
         mmio = self._mmio
 
-        # Step 1: Clear RESP (write 0)
-        mmio.smn_write32(SMN_C2PMSG_RESP, 0x00000000)
+        with _smu_mailbox_lock:
+            # Step 1: Clear RESP (write 0)
+            mmio.smn_write32(SMN_C2PMSG_RESP, 0x00000000)
 
-        # Step 2: Write parameter
-        mmio.smn_write32(SMN_C2PMSG_PARAM, param & 0xFFFFFFFF)
+            # Step 2: Write parameter
+            mmio.smn_write32(SMN_C2PMSG_PARAM, param & 0xFFFFFFFF)
 
-        # Step 3: Write message ID (triggers SMU)
-        mmio.smn_write32(SMN_C2PMSG_MSG, msg_id & 0xFFFFFFFF)
+            # Step 3: Write message ID (triggers SMU)
+            mmio.smn_write32(SMN_C2PMSG_MSG, msg_id & 0xFFFFFFFF)
 
-        # Step 4: Poll RESP until non-zero
-        deadline = time.perf_counter() + timeout_ms / 1000.0
-        poll_interval = 0.0001  # Start at 100us
-        max_interval = 0.010   # Cap at 10ms
+            # Step 4: Poll RESP until non-zero
+            deadline = time.perf_counter() + timeout_ms / 1000.0
+            poll_interval = 0.0001  # Start at 100us
+            max_interval = 0.010   # Cap at 10ms
 
-        resp = SMU_RESP_NONE
-        while time.perf_counter() < deadline:
-            resp = mmio.smn_read32(SMN_C2PMSG_RESP)
-            if resp != SMU_RESP_NONE:
-                break
-            time.sleep(poll_interval)
-            poll_interval = min(poll_interval * 1.5, max_interval)
+            resp = SMU_RESP_NONE
+            while time.perf_counter() < deadline:
+                resp = mmio.smn_read32(SMN_C2PMSG_RESP)
+                if resp != SMU_RESP_NONE:
+                    break
+                time.sleep(poll_interval)
+                poll_interval = min(poll_interval * 1.5, max_interval)
 
-        if resp == SMU_RESP_NONE:
-            try:
-                _smu_log.warning(f"[SMU] #{self._msg_count} TIMEOUT after {timeout_ms}ms waiting for {msg_name}")
-            except Exception:
-                pass
-            if self._verbose:
-                print(f"[SMU] TIMEOUT after {timeout_ms}ms waiting for response"
-                      f" to {msg_name}")
-            raise TimeoutError(
-                f"SMU did not respond to {msg_name} (0x{msg_id:02X}) "
-                f"within {timeout_ms}ms"
-            )
+            if resp == SMU_RESP_NONE:
+                try:
+                    _smu_log.warning(f"[SMU] #{self._msg_count} TIMEOUT after {timeout_ms}ms waiting for {msg_name}")
+                except Exception:
+                    pass
+                if self._verbose:
+                    print(f"[SMU] TIMEOUT after {timeout_ms}ms waiting for response"
+                          f" to {msg_name}")
+                raise TimeoutError(
+                    f"SMU did not respond to {msg_name} (0x{msg_id:02X}) "
+                    f"within {timeout_ms}ms"
+                )
 
-        # Step 5: Read return value from PARAM
-        return_value = mmio.smn_read32(SMN_C2PMSG_PARAM)
+            # Step 5: Read return value from PARAM
+            return_value = mmio.smn_read32(SMN_C2PMSG_PARAM)
 
         resp_name = _RESP_NAMES.get(resp, f"0x{resp:02X}")
         try:
@@ -609,6 +622,63 @@ class SmuCmd:
         """Re-enable GFXOFF idle state."""
         return self.send_msg_ok(PPSMC.AllowGfxOff)
 
+    def allow_gfx_dcs(self):
+        """Allow GFX Dynamic Clock Spreading."""
+        return self.send_msg_ok(PPSMC.AllowGfxDcs)
+
+    def disallow_gfx_dcs(self):
+        """Disallow GFX Dynamic Clock Spreading."""
+        return self.send_msg_ok(PPSMC.DisallowGfxDcs)
+
+    def enable_all_features(self):
+        """Send EnableAllSmuFeatures — activates all features the allowed mask permits.
+
+        Returns:
+            (resp_code, return_value) tuple from send_msg.
+        """
+        return self.send_msg(PPSMC.EnableAllSmuFeatures, 0)
+
+    def disable_all_features(self):
+        """Send DisableAllSmuFeatures — disables all features the allowed mask permits.
+
+        Returns:
+            (resp_code, return_value) tuple from send_msg.
+        """
+        return self.send_msg(PPSMC.DisableAllSmuFeatures, 0)
+
+    def set_allowed_features_mask(self, low=0xFFFFFFFF, high=0xFFFFFFFF):
+        """
+        Set the SMU Allowed Features Mask (low and high 32-bit words).
+
+        The allowed mask controls which features the SMU will permit
+        enable/disable commands to change.  The Windows driver sets a
+        restrictive mask during init; calling this with 0xFFFFFFFF for
+        both halves unlocks all 64 feature bits (matching the Linux
+        driver's behaviour for SMU v14.0.2).
+
+        Must be called before enable_features_*/disable_features_* if
+        the target feature bit is not already in the allowed mask.
+
+        Args:
+            low:  Allowed mask for bits 0-31  (default 0xFFFFFFFF = all).
+            high: Allowed mask for bits 32-63 (default 0xFFFFFFFF = all).
+
+        Returns:
+            (resp_low, resp_high) tuple of raw SMU responses.
+
+        Raises:
+            RuntimeError: If either message is rejected by the SMU.
+        """
+        resp_lo = self.send_msg_ok(PPSMC.SetAllowedFeaturesMaskLow,
+                                   low & 0xFFFFFFFF)
+        resp_hi = self.send_msg_ok(PPSMC.SetAllowedFeaturesMaskHigh,
+                                   high & 0xFFFFFFFF)
+        _smu_log.info(
+            f"[SMU] Allowed features mask set: "
+            f"low=0x{low & 0xFFFFFFFF:08X} high=0x{high & 0xFFFFFFFF:08X}"
+        )
+        return resp_lo, resp_hi
+
     def disable_features_low(self, bitmask):
         """
         Disable SMU features by bitmask (low 32 bits).
@@ -674,6 +744,57 @@ class SmuCmd:
     def hdp_flush(self):
         """Flush+invalidate the HDP cache to ensure CPU/GPU coherency around DMA transfers."""
         self._mmio.hdp_flush()
+
+    # ---- Tools DRAM path (separate from Windows driver's address) ----
+
+    def setup_tools_dram(self, mc_addr):
+        """Set the Tools DRAM address and configure transfer_read/write to use Tools msgs.
+
+        The Tools DRAM address (0x10/0x11) is independent of the Driver DRAM
+        address (0x0E/0x0F).  The Windows driver never touches the Tools address,
+        so we can freely set it and use 0x52/0x53 without racing the driver.
+
+        Args:
+            mc_addr: 64-bit GPU MC address of the DMA buffer.
+
+        Returns:
+            (old_read, old_write) — the previous transfer_read/write msg IDs
+            so the caller can restore them if needed.
+        """
+        old_read = self.transfer_read
+        old_write = self.transfer_write
+
+        self.set_dram_addr(mc_addr, use_tools=True)
+
+        self.transfer_read = PPSMC.TransferTableSmu2DramWithAddr
+        self.transfer_write = PPSMC.TransferTableDram2SmuWithAddr
+
+        if self._verbose:
+            print(f"[SMU] Tools DRAM path active: read=0x{self.transfer_read:02X} "
+                  f"write=0x{self.transfer_write:02X}")
+
+        return old_read, old_write
+
+    def restore_transfer_msgs(self, old_read, old_write):
+        """Restore transfer_read/write to previously saved msg IDs."""
+        self.transfer_read = old_read
+        self.transfer_write = old_write
+
+    def transfer_table_tools_to_smu(self, table_id):
+        """Write a table from DRAM to SMU using the Tools path (msg 0x53).
+
+        Must call setup_tools_dram() first to set the address.
+        Does NOT modify self.transfer_write — uses the Tools msg directly.
+        """
+        return self.send_msg(PPSMC.TransferTableDram2SmuWithAddr, table_id & 0xFFFF)
+
+    def transfer_table_tools_from_smu(self, table_id):
+        """Read a table from SMU to DRAM using the Tools path (msg 0x52).
+
+        Must call setup_tools_dram() first to set the address.
+        Does NOT modify self.transfer_read — uses the Tools msg directly.
+        """
+        return self.send_msg(PPSMC.TransferTableSmu2DramWithAddr, table_id & 0xFFFF)
 
     # ---- DRAM table transfer ----
 

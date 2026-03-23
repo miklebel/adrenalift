@@ -41,7 +41,7 @@ _UPP_AVAILABLE = False
 try:
     if not getattr(sys, "frozen", False):
         _script_dir = os.path.dirname(os.path.abspath(__file__))
-        _upp_src = os.path.join(_script_dir, "..", "..", "..", "upp", "src")
+        _upp_src = os.path.join(_script_dir, "..", "..", "deps", "upp", "src")
         if os.path.isdir(_upp_src) and _upp_src not in sys.path:
             sys.path.insert(0, os.path.abspath(_upp_src))
     from upp import decode as _upp_decode

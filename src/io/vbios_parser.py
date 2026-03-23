@@ -33,9 +33,9 @@ from typing import Dict, List, Optional, Tuple
 _UPP_AVAILABLE = False
 try:
     if not getattr(sys, "frozen", False):
-        # Running from source: add sibling upp/src to path (src/io -> project -> upp)
+        # Running from source: add deps/upp/src to path
         _script_dir = os.path.dirname(os.path.abspath(__file__))
-        _upp_src = os.path.join(_script_dir, "..", "..", "..", "upp", "src")
+        _upp_src = os.path.join(_script_dir, "..", "..", "deps", "upp", "src")
         if os.path.isdir(_upp_src) and _upp_src not in sys.path:
             sys.path.insert(0, os.path.abspath(_upp_src))
     from upp import decode as _upp_decode
@@ -758,7 +758,7 @@ def _main() -> int:
     if _UPP_AVAILABLE:
         print("  upp: available (RDNA3/4 supported)")
     else:
-        print("  upp: not found (add ../upp/src or pip install upp for RDNA3/4)")
+        print("  upp: not found (clone into deps/upp or pip install upp for RDNA3/4)")
 
     result = parse_vbios(args.rom, verbose=True)
 

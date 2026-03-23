@@ -1,18 +1,25 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec for RDNA4 Overclock GUI.
+PyInstaller spec for Adrenalift.
 Bundles as single .exe (onefile): upp, PySide6, driver DLLs, everything included.
 Requires: inpoutx64.dll, WinRing0x64.dll, WinRing0x64.sys (and optionally
 WinRing0x64_patched.sys) in drivers/ before building. At first run, the exe
 extracts and copies drivers to its folder. Run as Administrator.
 """
 
+import json
 import os
 
 block_cipher = None
 
-# Upp package for RDNA4 VBIOS parsing (sibling of driver_cache_overwrite)
-upp_src = os.path.join(SPECPATH, "..", "upp", "src")
+# Read version info for exe naming
+_version_path = os.path.join(SPECPATH, "version.json")
+with open(_version_path, "r", encoding="utf-8") as _vf:
+    _version_info = json.load(_vf)
+_exe_name = f"Adrenalift_{_version_info['version']}_{_version_info['build']}"
+
+# Upp package for RDNA4 VBIOS parsing (cloned into deps/)
+upp_src = os.path.join(SPECPATH, "deps", "upp", "src")
 upp_available = os.path.isdir(upp_src)
 
 # Collect InpOut32/WinRing0 driver files from drivers/ if present
@@ -32,13 +39,13 @@ for name in driver_names:
 if not any("inpoutx64" in p for p, _ in driver_files):
     print("WARNING: inpoutx64.dll not found in drivers/. Copy driver files to drivers/ before building.")
 if not upp_available:
-    print("WARNING: upp package not found at ../upp/src. RDNA4 VBIOS parsing may fail when bundled.")
+    print("WARNING: upp package not found at deps/upp/src. Clone it: git clone https://github.com/sibradzic/upp.git deps/upp")
 
 a = Analysis(
     ["src/app/main.py"],
     pathex=[SPECPATH, os.path.join(SPECPATH, "src")] + ([upp_src] if upp_available else []),
     binaries=[],
-    datas=driver_files,
+    datas=driver_files + [(_version_path, ".")],
     hiddenimports=[
         "PySide6.QtCore",
         "PySide6.QtGui",
@@ -52,6 +59,7 @@ a = Analysis(
         "src",
         "src.app",
         "src.app.main",
+        "src.app.startup_task",
         "src.app.workers",
         "src.engine",
         "src.engine.overclock_engine",
@@ -82,7 +90,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name="RDNA4_Overclock",
+    name=_exe_name,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
