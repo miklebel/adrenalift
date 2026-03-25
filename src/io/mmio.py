@@ -1513,15 +1513,16 @@ class InpOut32:
                             dev_match = re.search(r'DEV_([0-9A-F]{4})', current_id)
                             did = int(dev_match.group(1), 16) if dev_match else 0
 
-                            # Parse "PCI bus 12, device 0, function 0"
-                            loc_match = re.search(
-                                r'bus\s+(\d+).*device\s+(\d+).*function\s+(\d+)',
-                                current_loc, re.IGNORECASE
-                            )
-                            if loc_match:
-                                bus = int(loc_match.group(1))
-                                dev = int(loc_match.group(2))
-                                func = int(loc_match.group(3))
+                            # Parse location: extract bus/dev/func numbers.
+                            # The string is localized by Windows, e.g.:
+                            #   English:    "PCI bus 12, device 0, function 0"
+                            #   Norwegian:  "PCI-buss 3, enhet 0, funksjon 0"
+                            #   Portuguese: "Barramento PCI 3, dispositivo 0, função 0"
+                            loc_nums = re.findall(r'\d+', current_loc)
+                            if len(loc_nums) >= 3:
+                                bus = int(loc_nums[0])
+                                dev = int(loc_nums[1])
+                                func = int(loc_nums[2])
                                 results.append((bus, dev, func, did))
 
                     current_id = None
