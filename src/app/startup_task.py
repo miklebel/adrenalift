@@ -30,7 +30,8 @@ def get_startup_task_exe() -> str | None:
     try:
         r = subprocess.run(
             ["schtasks", "/Query", "/TN", TASK_NAME, "/FO", "LIST", "/V"],
-            capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW,
+            capture_output=True, encoding="utf-8", errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
     except OSError as exc:
         _log.warning("schtasks query failed: %s", exc)
@@ -61,7 +62,8 @@ def enable_startup(exe_path: str | None = None) -> bool:
                 "/SC", "ONLOGON",
                 "/RL", "HIGHEST",
             ],
-            capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW,
+            capture_output=True, encoding="utf-8", errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
         if r.returncode == 0:
             _log.info("Startup task created/updated -> %s", exe_path)
@@ -78,7 +80,8 @@ def disable_startup() -> bool:
     try:
         r = subprocess.run(
             ["schtasks", "/Delete", "/TN", TASK_NAME, "/F"],
-            capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW,
+            capture_output=True, encoding="utf-8", errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
         if r.returncode == 0:
             _log.info("Startup task removed")
