@@ -1469,18 +1469,18 @@ def _mp_scan_range(indices, inc_patterns):
                 _mp_progress.value += 1
             continue
         try:
-            buf = (ctypes.c_ubyte * CHUNK_SIZE)()
-            ctypes.memmove(buf, virt, CHUNK_SIZE)
-            data = bytes(buf)
-            inc_data = data.translate(_INC_TABLE)
-            for pi, inc_pat in enumerate(inc_patterns):
-                pos = 0
-                while True:
-                    idx = inc_data.find(inc_pat, pos)
-                    if idx < 0:
-                        break
-                    local_found.append((phys_base + idx, pi))
-                    pos = idx + 2
+            buf, safe_len = _safe_read_mapped(virt, CHUNK_SIZE)
+            if safe_len == CHUNK_SIZE:
+                data = bytes(buf)
+                inc_data = data.translate(_INC_TABLE)
+                for pi, inc_pat in enumerate(inc_patterns):
+                    pos = 0
+                    while True:
+                        idx = inc_data.find(inc_pat, pos)
+                        if idx < 0:
+                            break
+                        local_found.append((phys_base + idx, pi))
+                        pos = idx + 2
         finally:
             _mp_inpout.unmap_phys(virt, handle)
         with _mp_progress.get_lock():
@@ -1499,18 +1499,18 @@ def _mp_scan_range_windows(phys_bases, inc_patterns):
                 _mp_progress.value += 1
             continue
         try:
-            buf = (ctypes.c_ubyte * CHUNK_SIZE)()
-            ctypes.memmove(buf, virt, CHUNK_SIZE)
-            data = bytes(buf)
-            inc_data = data.translate(_INC_TABLE)
-            for pi, inc_pat in enumerate(inc_patterns):
-                pos = 0
-                while True:
-                    idx = inc_data.find(inc_pat, pos)
-                    if idx < 0:
-                        break
-                    local_found.append((phys_base + idx, pi))
-                    pos = idx + 2
+            buf, safe_len = _safe_read_mapped(virt, CHUNK_SIZE)
+            if safe_len == CHUNK_SIZE:
+                data = bytes(buf)
+                inc_data = data.translate(_INC_TABLE)
+                for pi, inc_pat in enumerate(inc_patterns):
+                    pos = 0
+                    while True:
+                        idx = inc_data.find(inc_pat, pos)
+                        if idx < 0:
+                            break
+                        local_found.append((phys_base + idx, pi))
+                        pos = idx + 2
         finally:
             _mp_inpout.unmap_phys(virt, handle)
         with _mp_progress.get_lock():
@@ -2686,6 +2686,40 @@ def get_dpm_ranges(smu):
 _OFFSET_SCAN_WINDOW = 64 * 1024 * 1024   # 64 MB default mapping window
 
 
+# ---------------------------------------------------------------------------
+# Safe physical memory read (SEH-protected via ReadProcessMemory)
+# ---------------------------------------------------------------------------
+# On some platforms, mapped physical addresses backed by device MMIO or
+# unmapped space trigger a fatal access violation when read via plain
+# ctypes/memoryview.  kernel32.ReadProcessMemory has built-in Structured
+# Exception Handling — it returns FALSE instead of crashing on bad pages.
+
+_k32_ReadProcessMemory = ctypes.windll.kernel32.ReadProcessMemory
+_k32_ReadProcessMemory.argtypes = [
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+    ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t),
+]
+_k32_ReadProcessMemory.restype = ctypes.c_int
+_k32_self = ctypes.windll.kernel32.GetCurrentProcess()
+
+
+def _safe_read_mapped(virt, size):
+    """Safely copy *size* bytes from virtual address *virt* into a local buffer.
+
+    Uses kernel32.ReadProcessMemory on our own process.  If the mapped
+    physical pages behind *virt* trigger an access violation (unmapped
+    address space, device MMIO, etc.) the call returns short instead of
+    killing the process.
+
+    Returns (ctypes_buffer, bytes_read).  *bytes_read* may be less than
+    *size* when the region is only partially readable.
+    """
+    buf = (ctypes.c_ubyte * size)()
+    n = ctypes.c_size_t(0)
+    _k32_ReadProcessMemory(_k32_self, virt, buf, size, ctypes.byref(n))
+    return buf, n.value
+
+
 def _offset_scan_chunk_list(chunk_indices, page_offset, fingerprint):
     """Scan a contiguous slice of chunk indices (worker entry point).
 
@@ -2733,17 +2767,24 @@ def _offset_scan_chunk_list(chunk_indices, page_offset, fingerprint):
             continue
 
         try:
-            arr = (ctypes.c_ubyte * window).from_address(virt)
-            mv = memoryview(arr)
-            probe = bytes(mv[page_offset::4096])
-            pos = -1
-            while True:
-                pos = probe.find(fp_head, pos + 1)
-                if pos == -1:
-                    break
-                off = pos * 4096 + page_offset
-                if ctypes.string_at(virt + off, fp_len) == fingerprint:
-                    matches.append(phys_base + off)
+            buf, safe_len = _safe_read_mapped(virt, window)
+            if safe_len < window:
+                _elog(f"_offset_scan_chunk_list: partial read at "
+                      f"0x{phys_base:X} ({safe_len}/{window} bytes)")
+            if safe_len >= page_offset + fp_len:
+                mv = memoryview(buf)[:safe_len]
+                probe = bytes(mv[page_offset::4096])
+                pos = -1
+                while True:
+                    pos = probe.find(fp_head, pos + 1)
+                    if pos == -1:
+                        break
+                    off = pos * 4096 + page_offset
+                    if off + fp_len <= safe_len:
+                        candidate = ctypes.string_at(
+                            ctypes.addressof(buf) + off, fp_len)
+                        if candidate == fingerprint:
+                            matches.append(phys_base + off)
         finally:
             inpout.unmap_phys(virt, handle)
 
