@@ -1240,6 +1240,41 @@ _FALLBACK_MMIO_HOLE = (0xC0000000, 0xFFFFFFFF)
 _FALLBACK_MAX_GB = 32
 
 
+def _get_device_mmio_ranges():
+    """Query Windows WMI for device MMIO ranges (Win32_DeviceMemoryAddress).
+
+    Returns a sorted list of (start, end) tuples for all device memory
+    regions, including 64-bit PCIe BARs (GPU ReBAR, NVMe, etc.) that
+    sit above the 4 GB line.  Returns an empty list on failure.
+    """
+    try:
+        import subprocess
+        cmd = (
+            'powershell -NoProfile -Command "'
+            'Get-CimInstance Win32_DeviceMemoryAddress '
+            '| ForEach-Object {'
+            " Write-Output ('{0},{1}' -f $_.StartingAddress,$_.EndingAddress)"
+            '}"'
+        )
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=10, shell=True,
+        )
+        ranges = []
+        for line in result.stdout.strip().splitlines():
+            parts = line.strip().split(",")
+            if len(parts) == 2:
+                try:
+                    s, e = int(parts[0]), int(parts[1])
+                    ranges.append((s, e))
+                except ValueError:
+                    continue
+        ranges.sort()
+        return ranges
+    except Exception as exc:
+        _elog(f"_get_device_mmio_ranges: WMI query failed: {exc}")
+        return []
+
+
 def _get_total_physical_memory():
     """Return total installed physical RAM in bytes, or None on failure."""
     try:
@@ -1343,20 +1378,44 @@ def _compute_scan_ceiling(ram_ranges):
     return ceiling
 
 
-def _is_scannable(phys, mmio_hole):
-    """True unless *phys* falls inside the MMIO hole."""
-    if mmio_hole is None:
-        return True
-    return not (mmio_hole[0] <= phys <= mmio_hole[1])
+def _is_scannable(phys, mmio_hole, device_mmio_ranges=()):
+    """True unless *phys* falls inside any known MMIO region."""
+    if mmio_hole and mmio_hole[0] <= phys <= mmio_hole[1]:
+        return False
+    for s, e in device_mmio_ranges:
+        if s <= phys <= e:
+            return False
+    return True
+
+
+def _build_mmio_exclusion_set(mmio_hole, device_mmio_ranges):
+    """Build a set of chunk indices that overlap any known MMIO region.
+
+    Merges the legacy below-4GB MMIO hole with above-4GB device MMIO
+    ranges discovered via WMI (Win32_DeviceMemoryAddress).
+    """
+    all_ranges = []
+    if mmio_hole:
+        all_ranges.append(mmio_hole)
+    for s, e in device_mmio_ranges:
+        all_ranges.append((s, e))
+
+    excluded = set()
+    for rng_start, rng_end in all_ranges:
+        ci_first = rng_start // CHUNK_SIZE
+        ci_last = rng_end // CHUNK_SIZE
+        for ci in range(ci_first, ci_last + 1):
+            excluded.add(ci)
+    return excluded
 
 
 def _build_scannable_chunks(max_gb, ram_ranges):
     """Build the list of chunk indices to scan.
 
-    Scans from address 0 up to the RAM ceiling, **excluding only the PCI
-    MMIO hole** derived from the firmware map.  The ceiling is the higher
-    of the firmware range extent and the OS-reported total physical memory
-    (adjusted for the MMIO hole).
+    Scans from address 0 up to the RAM ceiling, excluding:
+      - The PCI MMIO hole (3-4 GB) derived from the firmware map
+      - Any above-4GB device MMIO regions discovered via WMI
+        (GPU Resizable BAR, NVMe BARs, etc.)
 
     When *ram_ranges* is None (registry read failed), falls back to the
     hardcoded 0xC0000000-0xFFFFFFFF exclusion with a *_FALLBACK_MAX_GB*
@@ -1365,16 +1424,28 @@ def _build_scannable_chunks(max_gb, ram_ranges):
     *max_gb* of 0 means "auto": computed ceiling, or *_FALLBACK_MAX_GB*
     when firmware is unavailable.
     """
+    device_mmio = _get_device_mmio_ranges()
+    above_4g = [(s, e) for s, e in device_mmio if s >= _FOUR_GB]
+    if above_4g:
+        _elog(f"_build_scannable_chunks: {len(above_4g)} above-4GB "
+              f"MMIO region(s) from WMI (will exclude from scan):")
+        for s, e in above_4g:
+            size_mb = (e - s + 1) / (1024 * 1024)
+            _elog(f"  0x{s:010X}-0x{e:010X} ({size_mb:.1f} MB)")
+    else:
+        _elog("_build_scannable_chunks: no above-4GB MMIO regions "
+              "detected via WMI")
+
     if ram_ranges is None:
         effective_gb = max_gb if max_gb > 0 else _FALLBACK_MAX_GB
         max_bytes = effective_gb * 1024 * 1024 * 1024
         total_chunks = max_bytes // CHUNK_SIZE
-        chunk_indices = []
-        for ci in range(total_chunks):
-            phys_base = ci * CHUNK_SIZE
-            if _FALLBACK_MMIO_HOLE[0] <= phys_base <= _FALLBACK_MMIO_HOLE[1]:
-                continue
-            chunk_indices.append(ci)
+        excluded = _build_mmio_exclusion_set(_FALLBACK_MMIO_HOLE, above_4g)
+        chunk_indices = [ci for ci in range(total_chunks)
+                         if ci not in excluded]
+        _elog(f"_build_scannable_chunks: {len(chunk_indices)} chunks "
+              f"(excluded {len(excluded)} MMIO chunks, "
+              f"fallback mode, ceiling={effective_gb} GB)")
         return chunk_indices
 
     ceiling = _compute_scan_ceiling(ram_ranges)
@@ -1382,13 +1453,13 @@ def _build_scannable_chunks(max_gb, ram_ranges):
         ceiling = min(ceiling, max_gb * 1024 * 1024 * 1024)
 
     mmio_hole = _find_mmio_hole(ram_ranges)
+    excluded = _build_mmio_exclusion_set(mmio_hole, above_4g)
     total_chunks = (ceiling + CHUNK_SIZE - 1) // CHUNK_SIZE
-    chunk_indices = []
-    for ci in range(total_chunks):
-        phys_base = ci * CHUNK_SIZE
-        if mmio_hole and mmio_hole[0] <= phys_base <= mmio_hole[1]:
-            continue
-        chunk_indices.append(ci)
+    chunk_indices = [ci for ci in range(total_chunks)
+                     if ci not in excluded]
+    _elog(f"_build_scannable_chunks: {len(chunk_indices)} chunks "
+          f"(excluded {len(excluded)} MMIO chunks, "
+          f"ceiling={ceiling / (1024**3):.1f} GB)")
     return chunk_indices
 
 
@@ -1716,6 +1787,9 @@ def scan_memory_windows(inpout, patterns, centers, window_mb=512,
         _elog(fallback_msg)
         cb(0, fallback_msg)
 
+    device_mmio = _get_device_mmio_ranges()
+    above_4g_mmio = [(s, e) for s, e in device_mmio if s >= _FOUR_GB]
+
     half = (window_mb * 1024 * 1024) // 2
     chunks = set()
     for c in centers:
@@ -1723,7 +1797,7 @@ def scan_memory_windows(inpout, patterns, centers, window_mb=512,
         end = c + half
         phys = (start // CHUNK_SIZE) * CHUNK_SIZE
         while phys < end:
-            if _is_scannable(phys, mmio_hole):
+            if _is_scannable(phys, mmio_hole, above_4g_mmio):
                 chunks.add(phys)
             phys += CHUNK_SIZE
 
