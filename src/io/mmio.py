@@ -1052,8 +1052,8 @@ class GpuMMIO:
             did = device_id
         else:
             common = [
+                0x7550,                     # Navi 48 / RX 9070 XT/XTX (RDNA4)
                 0x7590,                     # Navi 44 / RX 9060 XT (RDNA4)
-                0x15BF, 0x15C8,             # Navi 44/48 alt IDs (RDNA4)
                 0x744C, 0x7480,             # Navi 31 (RDNA3)
                 0x73DF, 0x73BF,             # Navi 22/21 (RDNA2)
                 0x7340, 0x731F,             # Navi 14/10 (RDNA1)
@@ -1490,8 +1490,8 @@ class InpOut32:
             )
             out = subprocess.check_output(
                 ["powershell", "-NoProfile", "-Command", ps_cmd],
-                text=True, timeout=15, creationflags=0x08000000  # CREATE_NO_WINDOW
-            ).strip()
+                timeout=15, creationflags=0x08000000  # CREATE_NO_WINDOW
+            ).decode("utf-8", errors="replace").strip()
 
             # Parse output blocks like:
             #   InstanceId : PCI\VEN_1002&DEV_7590&SUBSYS_...
