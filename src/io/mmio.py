@@ -1042,15 +1042,36 @@ class GpuMMIO:
         """
         Auto-detect the GPU's BARs from PCI config space.
 
+        GPU discovery uses three tiers:
+          Tier 1 – caller supplies an explicit device_id  (instant, no scan)
+          Tier 2 – try a hardcoded list of common AMD device IDs
+          Tier 3 – fall back to PCI class-code scan (VGA 03:00) and
+                   verify the vendor is AMD by reading PCI config reg 0x00
+
+        The `common` list in tier 2 is an optimisation / fast-path only.
+        Tier 3 will find *any* AMD VGA device regardless of device ID, so
+        GPUs missing from the list still work -- just a bit slower to probe.
+
+        Source of truth for PCI device IDs: https://pci-ids.ucw.cz/read/PC/1002
+        (the Linux kernel amdgpu driver uses CHIP_IP_DISCOVERY catch-all for
+        anything newer than RDNA2, so its pciidlist is NOT a complete reference)
+
         Returns: (pci_addr, mmio_bar_phys, io_bar_port_or_None, vram_bar_phys_or_None)
         """
         wr0 = winring0
 
-        # --- Find GPU PCI device ---
+        # --- Tier 1: explicit device_id from caller ---
+        # Currently smu.py always passes device_id=None, so this path is
+        # only used if a future caller (or user override) supplies one.
         if device_id is not None:
             pci_addr = wr0.find_pci_device(vendor_id, device_id)
             did = device_id
         else:
+            # --- Tier 2: try well-known device IDs (fast path) ---
+            # Each ID is probed via find_pci_device(); first hit wins.
+            # Only the *most common* SKU per generation is listed here --
+            # less common variants (e.g. 0x7551 Navi 48 AI PRO) are
+            # intentionally omitted because tier 3 catches them anyway.
             common = [
                 0x7550,                     # Navi 48 / RX 9070 XT/XTX (RDNA4)
                 0x7590,                     # Navi 44 / RX 9060 XT (RDNA4)
@@ -1066,6 +1087,10 @@ class GpuMMIO:
                 except RuntimeError:
                     continue
 
+            # --- Tier 3: PCI class-code fallback ---
+            # If none of the known IDs matched (new/rare SKU), ask for
+            # ANY device with class 03:00 (VGA compatible controller) and
+            # read its vendor+device ID from PCI config register 0x00.
             if pci_addr is None:
                 try:
                     pci_addr = wr0.find_pci_by_class(0x03, 0x00)
