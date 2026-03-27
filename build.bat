@@ -15,8 +15,11 @@ echo Checking dependencies...
 )
 
 echo.
+echo Cleaning previous build cache...
+if exist build rmdir /s /q build
+
 echo Building with PyInstaller...
-%PY% -m PyInstaller --noconfirm build.spec
+%PY% -m PyInstaller --noconfirm --clean build.spec
 
 if %ERRORLEVEL% EQU 0 (
     echo.

@@ -29,8 +29,12 @@ try {
 }
 
 Write-Host ""
+Write-Host "Cleaning previous build cache..."
+$buildDir = Join-Path $PSScriptRoot "build"
+if (Test-Path $buildDir) { Remove-Item $buildDir -Recurse -Force }
+
 Write-Host "Building with PyInstaller..."
-& $py -m PyInstaller --noconfirm build.spec
+& $py -m PyInstaller --noconfirm --clean build.spec
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host ""
