@@ -30,7 +30,10 @@ from src.engine.overclock_engine import (
     read_pptable_at_addr,
     read_smu_metrics_full,
     read_smu_table_raw,
+    read_f32,
+    read_u8,
     read_u16,
+    read_u32,
     scan_for_pptable,
     vram_scan_for_dma,
     read_pfe_settings,
@@ -318,12 +321,19 @@ class DetailedRefreshWorker(QThread):
                     if ram_data is None:
                         ram_data = {}
                     base = self.valid_addrs[0]
+                    _type_reader = {
+                        "B": read_u8, "b": read_u8,
+                        "H": read_u16, "h": read_u16,
+                        "I": read_u32, "L": read_u32, "i": read_u32, "l": read_u32,
+                        "f": read_f32,
+                    }
                     for key, meta in self.pp_ram_offset_map.items():
                         off = meta.get("offset")
                         if off is None:
                             continue
                         try:
-                            ram_data[key] = read_u16(inpout, base, int(off))
+                            reader = _type_reader.get(meta.get("type", "H"), read_u16)
+                            ram_data[key] = reader(inpout, base, int(off))
                         except Exception:
                             continue
 

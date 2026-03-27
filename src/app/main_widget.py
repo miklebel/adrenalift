@@ -436,6 +436,8 @@ class MainOverclockWidget(QWidget):
     def _update_detailed_live_columns(self, ram_data, od_table, metrics, smu_state=None):
         def _fmt(val, suffix=""):
             if val is not None:
+                if isinstance(val, float):
+                    return f"{val:.6g}{suffix}"
                 return f"{val}{suffix}"
             return "—"
         updated = 0
@@ -460,15 +462,6 @@ class MainOverclockWidget(QWidget):
                         cv_label.setText("—")
                 else:
                     cv_label.setText("Unavailable")
-            elif smu_key == "gfxclk" and metrics:
-                cv_label.setText(_fmt(metrics[0], " MHz"))
-                updated += 1
-            elif smu_key == "ppt" and metrics:
-                cv_label.setText(_fmt(metrics[2], " W"))
-                updated += 1
-            elif smu_key == "temp" and metrics:
-                cv_label.setText(_fmt(metrics[3], " °C"))
-                updated += 1
             elif smu_key and smu_key.startswith("smu_") and smu_state:
                 val = smu_state.get(smu_key)
                 if val is not None:
@@ -568,6 +561,8 @@ class MainOverclockWidget(QWidget):
                      f"od={od_table is not None}, metrics={metrics is not None}, "
                      f"smu={smu_state is not None and len(smu_state) if smu_state else None}")
         self._update_detailed_live_columns(ram_data, od_table, metrics, smu_state)
+        if ram_data is not None:
+            self.pp_tab.sync_spinboxes_from_ram(ram_data)
         if od_table:
             self._update_od_from_scan(od_table)
             if self.scan_result is None:

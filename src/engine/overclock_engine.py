@@ -1061,6 +1061,18 @@ def validate_od_candidate(inpout, phys_addr):
     return od
 
 
+def read_u8(inpout, phys_addr, offset):
+    """Read a uint8 at physical address + offset."""
+    addr = phys_addr + offset
+    page_base = addr & ~0xFFF
+    page_off = addr - page_base
+    virt, handle = inpout.map_phys(page_base, 4096)
+    try:
+        return ctypes.c_ubyte.from_address(virt + page_off).value
+    finally:
+        inpout.unmap_phys(virt, handle)
+
+
 def read_u16(inpout, phys_addr, offset):
     """Read a uint16 at physical address + offset."""
     addr = phys_addr + offset
@@ -1071,6 +1083,25 @@ def read_u16(inpout, phys_addr, offset):
         return ctypes.c_ushort.from_address(virt + page_off).value
     finally:
         inpout.unmap_phys(virt, handle)
+
+
+def read_u32(inpout, phys_addr, offset):
+    """Read a uint32 at physical address + offset."""
+    addr = phys_addr + offset
+    page_base = addr & ~0xFFF
+    page_off = addr - page_base
+    map_size = 8192 if page_off + 4 > 4096 else 4096
+    virt, handle = inpout.map_phys(page_base, map_size)
+    try:
+        return ctypes.c_uint.from_address(virt + page_off).value
+    finally:
+        inpout.unmap_phys(virt, handle)
+
+
+def read_f32(inpout, phys_addr, offset):
+    """Read 4 bytes at physical address + offset, return as IEEE 754 float."""
+    raw_u32 = read_u32(inpout, phys_addr, offset)
+    return struct.unpack('<f', struct.pack('<I', raw_u32))[0]
 
 
 def patch_u16(inpout, phys_addr, offset, new_val):
@@ -3069,10 +3100,10 @@ def scan_for_pptable(inpout, settings, scan_opts=None, progress_callback=None,
         cb(20, f"Search pattern (patched):  {patched_clock_pattern.hex(' ').upper()}")
 
     # ------------------------------------------------------------------
-    # CACHED-ADDRESS fast path: trusted when golden_pp_id matches.
-    # The address was already validated during the scan that cached it;
-    # a matching golden_pp_id means same GPU / same VBIOS, so the
-    # physical address hasn't moved.
+    # CACHED-ADDRESS fast path: re-validated when golden_pp_id matches.
+    # The address was validated during the scan that cached it, but
+    # physical memory may have been remapped since (reboot, driver
+    # reload).  Read MsgLimits and re-check before trusting.
     # ------------------------------------------------------------------
     _pptable_cached = _load_pptable_cache()
     if (_pptable_cached is not None
@@ -3082,35 +3113,56 @@ def scan_for_pptable(inpout, settings, scan_opts=None, progress_callback=None,
         cached_addr, _cached_gpid = _pptable_cached
         cb(5, f"PP table cache hit: 0x{cached_addr:012X} (golden_pp_id={_cached_gpid})")
 
-        page_base = cached_addr & ~0xFFF
-        page_off = cached_addr - page_base
-        v, h = inpout.map_phys(page_base, 4096)
-        game_val = ctypes.c_ushort.from_address(v + page_off + 2).value
-        boost_val = ctypes.c_ushort.from_address(v + page_off + 4).value
-        inpout.unmap_phys(v, h)
+        _cache_valid = False
+        try:
+            ml = read_msglimits(inpout, cached_addr + 28)
+            _cache_valid, _cache_reasons = is_valid_pptable(ml)
+            if _cache_valid and vbios_values is not None:
+                ppt = ml['ppt0_ac']
+                exp_ppt = vbios_values.power_ac
+                ppt_lo, ppt_hi = int(exp_ppt * 0.5), int(exp_ppt * 1.5)
+                if not (ppt_lo <= ppt <= ppt_hi):
+                    _cache_valid = False
+                    _cache_reasons.append(
+                        f"PPT={ppt}W outside VBIOS±50% [{ppt_lo}-{ppt_hi}]")
+        except (IOError, OSError):
+            _cache_reasons = ["Unreadable at cached address"]
 
-        target_game = settings._game_clock()
-        target_boost = settings._boost_clock()
-        orig_game = vbios_values.gameclock_ac
-        is_patched = (game_val == target_game and boost_val == target_boost
-                      and game_val != orig_game)
+        if _cache_valid:
+            page_base = cached_addr & ~0xFFF
+            page_off = cached_addr - page_base
+            v, h = inpout.map_phys(page_base, 4096)
+            game_val = ctypes.c_ushort.from_address(v + page_off + 2).value
+            boost_val = ctypes.c_ushort.from_address(v + page_off + 4).value
+            inpout.unmap_phys(v, h)
 
-        cb(100, f"PP table cache valid — returning 0x{cached_addr:012X}")
-        _elog(f"pptable_cache: hit at 0x{cached_addr:X}")
-        return ScanResult(
-            valid_addrs=[cached_addr],
-            already_patched_addrs=[cached_addr] if is_patched else [],
-            rejected_addrs=[],
-            all_clock_addrs=[cached_addr],
-            did_full_scan=False,
-            match_details=[{
-                'addr': cached_addr, 'valid': True,
-                'already_patched': is_patched,
-                'game_clock': game_val, 'boost_clock': boost_val,
-                'msglimits': {}, 'reject_reasons': [],
-            }],
-            fingerprint_validated=True,
-        )
+            target_game = settings._game_clock()
+            target_boost = settings._boost_clock()
+            orig_game = vbios_values.gameclock_ac
+            is_patched = (game_val == target_game and boost_val == target_boost
+                          and game_val != orig_game)
+
+            cb(100, f"PP table cache valid — returning 0x{cached_addr:012X}")
+            _elog(f"pptable_cache: hit at 0x{cached_addr:X}")
+            return ScanResult(
+                valid_addrs=[cached_addr],
+                already_patched_addrs=[cached_addr] if is_patched else [],
+                rejected_addrs=[],
+                all_clock_addrs=[cached_addr],
+                did_full_scan=False,
+                match_details=[{
+                    'addr': cached_addr, 'valid': True,
+                    'already_patched': is_patched,
+                    'game_clock': game_val, 'boost_clock': boost_val,
+                    'msglimits': dict(ml), 'reject_reasons': [],
+                }],
+                fingerprint_validated=True,
+            )
+        else:
+            cb(8, "PP table cache: data invalid — falling back to scan")
+            _elog(f"pptable_cache: validation failed at 0x{cached_addr:X}: "
+                  f"{_cache_reasons}")
+
     elif _pptable_cached is not None:
         cb(8, "PP table cache: golden_pp_id mismatch — ignoring cache")
         _elog(f"pptable_cache: golden_pp_id mismatch "
@@ -3827,13 +3879,20 @@ def _apply_pp_field_groups(inpout, scan_result, field_values, field_offset_map, 
             if off is None:
                 continue
             try:
-                if typ in ("B", "b"):
+                if typ == "f":
+                    int_val = struct.unpack('<I', struct.pack('<f', float(value)))[0]
+                    _, verify = patch_u32(inpout, addr, int(off), int_val)
+                    ok = (int(verify) == int_val)
+                elif typ in ("B", "b"):
                     _, verify = patch_u8(inpout, addr, int(off), int(value))
+                    ok = (int(verify) == int(value))
                 elif typ in ("I", "L", "i", "l"):
                     _, verify = patch_u32(inpout, addr, int(off), int(value))
+                    ok = (int(verify) == int(value))
                 else:
                     _, verify = patch_u16(inpout, addr, int(off), int(value))
-                if int(verify) == int(value):
+                    ok = (int(verify) == int(value))
+                if ok:
                     writes_this_addr += 1
                     results['field_writes'] += 1
             except Exception:
@@ -3857,13 +3916,16 @@ def patch_pp_single_field(inpout, scan_result, offset, value, type_code="H"):
         return result
     result["addrs"] = len(scan_result.valid_addrs)
     off = int(offset)
-    val = int(value)
     typ = str(type_code)
+    if typ == "f":
+        val = struct.unpack('<I', struct.pack('<f', float(value)))[0]
+    else:
+        val = int(value)
     for addr in scan_result.valid_addrs:
         try:
             if typ in ("B", "b"):
                 _, verify = patch_u8(inpout, addr, off, val)
-            elif typ in ("I", "L", "i", "l"):
+            elif typ in ("I", "L", "i", "l", "f"):
                 _, verify = patch_u32(inpout, addr, off, val)
             else:
                 _, verify = patch_u16(inpout, addr, off, val)

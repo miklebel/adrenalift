@@ -13,6 +13,7 @@ import re
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -29,7 +30,7 @@ from PySide6.QtWidgets import (
 
 from src.app.constants import DEFAULT_VBIOS_PATH, PP_DUMPS_DIR
 from src.app.help_texts import PP_HELP_HTML
-from src.app.ui_helpers import make_spinbox, make_set_button, make_cheatsheet_button
+from src.app.ui_helpers import make_spinbox, make_float_spinbox, make_set_button, make_cheatsheet_button
 from src.io.vbios_parser import (
     VbiosValues,
     decode_pp_table_full,
@@ -117,12 +118,6 @@ class PPTab(QWidget):
         _SKIP_PAT = re.compile(
             r'^(Padding|Spare|Reserve|MmHubPadding|PADDING_)', re.IGNORECASE,
         )
-        _PP_SMU_KEY_MAP = {
-            "smc_pptable/SkuTable/DriverReportedClocks/GameClockAc": "gfxclk",
-            "smc_pptable/SkuTable/MsgLimits/Power/0/0": "ppt",
-            "smc_pptable/SkuTable/MsgLimits/Temperature/0": "temp",
-        }
-
         def _infer_unit(field_name):
             n = field_name.lower()
             if any(p in n for p in ("clock", "freq", "fmin", "fmax", "clk")):
@@ -175,27 +170,33 @@ class PPTab(QWidget):
 
         def _add_pp_leaf(parent_item, name, leaf, full_path):
             _QSPIN_MAX = (1 << 31) - 1
-            vb_val = int(leaf.get("value", 0))
             raw_offset = int(leaf.get("offset", -1))
             field_type = str(leaf.get("type", "H"))
             unit = _infer_unit(name)
             group = _infer_group(full_path)
-            smu_key = _PP_SMU_KEY_MAP.get(full_path)
 
-            if field_type in ("Q", "q"):
-                max_val = _QSPIN_MAX
-            elif field_type in ("I", "L", "i", "l"):
-                max_val = min(2_000_000_000, _QSPIN_MAX)
-            elif field_type in ("B", "b"):
-                max_val = 255
-            elif field_type in ("H", "h"):
-                max_val = 65535
+            is_float = (field_type == "f")
+            if is_float:
+                vb_val = float(leaf.get("value", 0.0))
+                widget = make_float_spinbox(vb_val, f" {unit}" if unit else "")
+                vb_display = f"{vb_val:.6g}"
             else:
-                max_val = _QSPIN_MAX
-            vb_val = max(0, min(vb_val, max_val))
-            widget = make_spinbox(0, max_val, vb_val, f" {unit}" if unit else "")
+                vb_val = int(leaf.get("value", 0))
+                if field_type in ("Q", "q"):
+                    max_val = _QSPIN_MAX
+                elif field_type in ("I", "L", "i", "l"):
+                    max_val = min(2_000_000_000, _QSPIN_MAX)
+                elif field_type in ("B", "b"):
+                    max_val = 255
+                elif field_type in ("H", "h"):
+                    max_val = 65535
+                else:
+                    max_val = _QSPIN_MAX
+                vb_val = max(0, min(vb_val, max_val))
+                widget = make_spinbox(0, max_val, vb_val, f" {unit}" if unit else "")
+                vb_display = str(vb_val)
 
-            item = QTreeWidgetItem(parent_item, [name, str(vb_val)])
+            item = QTreeWidgetItem(parent_item, [name, vb_display])
             cv_label = QLabel("---")
             pp_tree.setItemWidget(item, 2, cv_label)
             pp_tree.setItemWidget(item, 3, widget)
@@ -205,8 +206,6 @@ class PPTab(QWidget):
             self.param_unit[full_path] = f" {unit}" if unit else ""
             self.param_widgets[full_path] = widget
             self.pp_patch_keys.add(full_path)
-            if smu_key:
-                self.param_smu_key[full_path] = smu_key
             if raw_offset >= 0:
                 self.pp_ram_offset_map[full_path] = {
                     "offset": raw_offset - _bc_pp_off,
@@ -258,7 +257,7 @@ class PPTab(QWidget):
                 for j in range(top.childCount()):
                     top.child(j).setExpanded(True)
         else:
-            def _add_fallback_leaf(name, key, unit, vb_val, smu_key=None):
+            def _add_fallback_leaf(name, key, unit, vb_val):
                 sb = make_spinbox(0, 65535, int(vb_val) if vb_val and vb_val != "—" else 0,
                                   f" {unit}" if unit else "")
                 item = QTreeWidgetItem(pp_tree.invisibleRootItem(),
@@ -270,16 +269,14 @@ class PPTab(QWidget):
                 self.param_unit[key] = f" {unit}" if unit else ""
                 self.param_widgets[key] = sb
                 self.pp_patch_keys.add(key)
-                if smu_key:
-                    self.param_smu_key[key] = smu_key
 
-            _add_fallback_leaf("Game Clock", "GameClockAc", "MHz", vb.gameclock_ac, "gfxclk")
+            _add_fallback_leaf("Game Clock", "GameClockAc", "MHz", vb.gameclock_ac)
             _add_fallback_leaf("Boost Clock", "BoostClockAc", "MHz", vb.boostclock_ac)
-            _add_fallback_leaf("PPT AC", "PPT0_AC", "W", vb.power_ac, "ppt")
+            _add_fallback_leaf("PPT AC", "PPT0_AC", "W", vb.power_ac)
             _add_fallback_leaf("PPT DC", "PPT0_DC", "W", vb.power_dc)
             _add_fallback_leaf("TDC GFX", "TDC_GFX", "A", vb.tdc_gfx)
             _add_fallback_leaf("TDC SOC", "TDC_SOC", "A", vb.tdc_soc)
-            _add_fallback_leaf("Temp Edge", "Temp_Edge", "°C", vb.temp_edge or 100, "temp")
+            _add_fallback_leaf("Temp Edge", "Temp_Edge", "°C", vb.temp_edge or 100)
             _add_fallback_leaf("Temp Hotspot", "Temp_Hotspot", "°C", vb.temp_hotspot or 110)
             _add_fallback_leaf("Temp Mem", "Temp_Mem", "°C", vb.temp_mem or 100)
             _add_fallback_leaf("Temp VR GFX", "Temp_VR_GFX", "°C", vb.temp_vr_gfx or 115)
@@ -436,6 +433,13 @@ class PPTab(QWidget):
 
         updated = 0
 
+        def _safe_set(widget, val):
+            if isinstance(widget, QDoubleSpinBox):
+                clamped = max(widget.minimum(), min(float(val), widget.maximum()))
+            else:
+                clamped = max(widget.minimum(), min(int(val), widget.maximum()))
+            widget.setValue(clamped)
+
         def _walk_and_update(node, path_prefix):
             nonlocal updated
             if not isinstance(node, dict):
@@ -446,7 +450,7 @@ class PPTab(QWidget):
                     if isinstance(child, dict) and "value" in child and "offset" in child:
                         widget = self.param_widgets.get(child_path)
                         if widget and hasattr(widget, "setValue"):
-                            widget.setValue(int(child["value"]))
+                            _safe_set(widget, child["value"])
                             updated += 1
                     else:
                         _walk_and_update(child, child_path)
@@ -457,7 +461,7 @@ class PPTab(QWidget):
                     if "value" in child and "offset" in child:
                         widget = self.param_widgets.get(child_path)
                         if widget and hasattr(widget, "setValue"):
-                            widget.setValue(int(child["value"]))
+                            _safe_set(widget, child["value"])
                             updated += 1
                     else:
                         _walk_and_update(child, child_path)
@@ -467,25 +471,86 @@ class PPTab(QWidget):
                         if isinstance(elem, dict) and "value" in elem and "offset" in elem:
                             widget = self.param_widgets.get(elem_path)
                             if widget and hasattr(widget, "setValue"):
-                                widget.setValue(int(elem["value"]))
+                                _safe_set(widget, elem["value"])
                                 updated += 1
                         elif isinstance(elem, dict):
                             _walk_and_update(elem, elem_path)
 
+        dump_leaf_paths = []
+
+        def _collect_paths(node, path_prefix):
+            if not isinstance(node, dict):
+                return
+            if "entries" in node and isinstance(node["entries"], list):
+                for idx, child in enumerate(node["entries"]):
+                    child_path = f"{path_prefix}/{idx}" if path_prefix else str(idx)
+                    if isinstance(child, dict) and "value" in child and "offset" in child:
+                        dump_leaf_paths.append(child_path)
+                    else:
+                        _collect_paths(child, child_path)
+                return
+            for key, child in node.items():
+                child_path = f"{path_prefix}/{key}" if path_prefix else str(key)
+                if isinstance(child, dict):
+                    if "value" in child and "offset" in child:
+                        dump_leaf_paths.append(child_path)
+                    else:
+                        _collect_paths(child, child_path)
+                elif isinstance(child, list):
+                    for idx, elem in enumerate(child):
+                        elem_path = f"{child_path}/{idx}"
+                        if isinstance(elem, dict) and "value" in elem and "offset" in elem:
+                            dump_leaf_paths.append(elem_path)
+                        elif isinstance(elem, dict):
+                            _collect_paths(elem, elem_path)
+
+        _collect_paths(decoded.data, "")
         _walk_and_update(decoded.data, "")
-        self._log(f"Load Dump: updated {updated} spinbox values from {filename}")
+
+        if updated == 0 and dump_leaf_paths:
+            widget_keys = sorted(self.param_widgets.keys())[:3]
+            dump_sample = dump_leaf_paths[:3]
+            self._log(f"Load Dump: 0 matches! dump paths sample: {dump_sample}")
+            self._log(f"  widget keys sample: {widget_keys}")
+        self._log(f"Load Dump: updated {updated}/{len(dump_leaf_paths)} spinbox values "
+                  f"from {filename} ({len(self.param_widgets)} widgets registered)")
 
     # ------------------------------------------------------------------
 
-    def get_patch_values(self) -> dict[str, int]:
-        """Return user values for expanded PP patch fields."""
-        values: dict[str, int] = {}
+    def get_patch_values(self) -> dict:
+        """Return user values for expanded PP patch fields (int or float)."""
+        values: dict = {}
         for key in self.pp_patch_keys:
             widget = self.param_widgets.get(key)
             if widget is None or not hasattr(widget, "value"):
                 continue
-            values[key] = int(widget.value())
+            values[key] = widget.value()
         return values
+
+    def sync_spinboxes_from_ram(self, ram_data: dict) -> int:
+        """Update Custom input spinboxes to match current RAM values."""
+        if not isinstance(ram_data, dict):
+            self._log("PP sync: ram_data is not a dict, skipping")
+            return 0
+        matched = 0
+        synced = 0
+        for key in self.pp_patch_keys:
+            if key not in ram_data:
+                continue
+            matched += 1
+            widget = self.param_widgets.get(key)
+            if widget and hasattr(widget, "setValue"):
+                val = ram_data[key]
+                if val is not None:
+                    if isinstance(widget, QDoubleSpinBox):
+                        clamped = max(widget.minimum(), min(float(val), widget.maximum()))
+                    else:
+                        clamped = max(widget.minimum(), min(int(val), widget.maximum()))
+                    widget.setValue(clamped)
+                    synced += 1
+        self._log(f"PP sync: {len(self.pp_patch_keys)} patch keys, "
+                  f"{len(ram_data)} ram keys, {matched} matched, {synced} spinboxes set")
+        return synced
 
     @property
     def decoded(self):

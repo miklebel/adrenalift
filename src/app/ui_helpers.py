@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, QSize
 from PySide6.QtWidgets import (
+    QDoubleSpinBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -38,6 +39,21 @@ def make_spinbox(
         w.setSuffix(suffix)
     if special_value_text is not None:
         w.setSpecialValueText(special_value_text)
+    return w
+
+
+def make_float_spinbox(
+    value: float = 0.0,
+    suffix: str = "",
+) -> QDoubleSpinBox:
+    """Create a QDoubleSpinBox for IEEE 754 float PP table fields."""
+    w = QDoubleSpinBox()
+    w.setDecimals(6)
+    w.setRange(-3.4e38, 3.4e38)
+    w.setSingleStep(0.001)
+    w.setValue(value)
+    if suffix:
+        w.setSuffix(suffix)
     return w
 
 
