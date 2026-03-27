@@ -66,38 +66,23 @@ class PPTab(QWidget):
         vb = self.vbios_values
         pp_tab_layout = QVBoxLayout(self)
 
-        # -- Top area: cheatsheet + search (left) | dump list (right) --
-        top_area = QHBoxLayout()
-
-        left_col = QVBoxLayout()
         _, pp_hint_row = make_cheatsheet_button(
             self, "PP", PP_HELP_HTML, self._show_cheatsheet,
             tooltip="How PP Table RAM patching works",
             label="PP \u2014 PowerPlay Table",
         )
-        left_col.addLayout(pp_hint_row)
+        pp_tab_layout.addLayout(pp_hint_row)
+
+        body = QHBoxLayout()
+
+        # -- Left column: search + table --
+        left_col = QVBoxLayout()
 
         self._search_edit = QLineEdit()
         self._search_edit.setPlaceholderText("Search PP fields\u2026")
         self._search_edit.setClearButtonEnabled(True)
         self._search_edit.textChanged.connect(self._on_search_changed)
         left_col.addWidget(self._search_edit)
-        left_col.addStretch()
-        top_area.addLayout(left_col, stretch=1)
-
-        right_col = QVBoxLayout()
-        self._dump_list = QListWidget()
-        self._dump_list.setMaximumWidth(180)
-        self._dump_list.setMaximumHeight(100)
-        right_col.addWidget(self._dump_list)
-        self._load_dump_btn = QPushButton("Load Dump")
-        self._load_dump_btn.setMaximumWidth(180)
-        self._load_dump_btn.setToolTip("Load a saved PP dump into spinboxes (does not apply)")
-        self._load_dump_btn.clicked.connect(self._on_load_dump)
-        right_col.addWidget(self._load_dump_btn)
-        top_area.addLayout(right_col)
-
-        pp_tab_layout.addLayout(top_area)
 
         pp_grp = QGroupBox("PP — PowerPlay Table")
         pp_tree = QTreeWidget()
@@ -118,22 +103,6 @@ class PPTab(QWidget):
         _SKIP_PAT = re.compile(
             r'^(Padding|Spare|Reserve|MmHubPadding|PADDING_)', re.IGNORECASE,
         )
-        def _infer_unit(field_name):
-            n = field_name.lower()
-            if any(p in n for p in ("clock", "freq", "fmin", "fmax", "clk")):
-                return "MHz"
-            if any(p in n for p in ("power", "ppt", "socketpowerlimit")):
-                return "W"
-            if any(p in n for p in ("tdc", "edclimit")):
-                return "A"
-            if any(p in n for p in ("temp", "ctflimit")):
-                return "°C"
-            if any(p in n for p in ("voltage", "vmax", "vmin")):
-                return "mV"
-            if "rpm" in n:
-                return "RPM"
-            return ""
-
         def _infer_group(path):
             if "DriverReportedClocks/" in path:
                 return "clocks"
@@ -172,13 +141,12 @@ class PPTab(QWidget):
             _QSPIN_MAX = (1 << 31) - 1
             raw_offset = int(leaf.get("offset", -1))
             field_type = str(leaf.get("type", "H"))
-            unit = _infer_unit(name)
             group = _infer_group(full_path)
 
             is_float = (field_type == "f")
             if is_float:
                 vb_val = float(leaf.get("value", 0.0))
-                widget = make_float_spinbox(vb_val, f" {unit}" if unit else "")
+                widget = make_float_spinbox(vb_val, "")
                 vb_display = f"{vb_val:.6g}"
             else:
                 vb_val = int(leaf.get("value", 0))
@@ -193,7 +161,7 @@ class PPTab(QWidget):
                 else:
                     max_val = _QSPIN_MAX
                 vb_val = max(0, min(vb_val, max_val))
-                widget = make_spinbox(0, max_val, vb_val, f" {unit}" if unit else "")
+                widget = make_spinbox(0, max_val, vb_val, "")
                 vb_display = str(vb_val)
 
             item = QTreeWidgetItem(parent_item, [name, vb_display])
@@ -203,7 +171,7 @@ class PPTab(QWidget):
 
             self._item_to_path[item] = full_path
             self.param_current_value_widget[full_path] = cv_label
-            self.param_unit[full_path] = f" {unit}" if unit else ""
+            self.param_unit[full_path] = ""
             self.param_widgets[full_path] = widget
             self.pp_patch_keys.add(full_path)
             if raw_offset >= 0:
@@ -257,52 +225,70 @@ class PPTab(QWidget):
                 for j in range(top.childCount()):
                     top.child(j).setExpanded(True)
         else:
-            def _add_fallback_leaf(name, key, unit, vb_val):
-                sb = make_spinbox(0, 65535, int(vb_val) if vb_val and vb_val != "—" else 0,
-                                  f" {unit}" if unit else "")
+            def _add_fallback_leaf(name, key, vb_val):
+                sb = make_spinbox(0, 65535, int(vb_val) if vb_val and vb_val != "—" else 0, "")
                 item = QTreeWidgetItem(pp_tree.invisibleRootItem(),
                                        [name, str(vb_val) if vb_val else "—"])
                 cv_label = QLabel("---")
                 pp_tree.setItemWidget(item, 2, cv_label)
                 pp_tree.setItemWidget(item, 3, sb)
                 self.param_current_value_widget[key] = cv_label
-                self.param_unit[key] = f" {unit}" if unit else ""
+                self.param_unit[key] = ""
                 self.param_widgets[key] = sb
                 self.pp_patch_keys.add(key)
 
-            _add_fallback_leaf("Game Clock", "GameClockAc", "MHz", vb.gameclock_ac)
-            _add_fallback_leaf("Boost Clock", "BoostClockAc", "MHz", vb.boostclock_ac)
-            _add_fallback_leaf("PPT AC", "PPT0_AC", "W", vb.power_ac)
-            _add_fallback_leaf("PPT DC", "PPT0_DC", "W", vb.power_dc)
-            _add_fallback_leaf("TDC GFX", "TDC_GFX", "A", vb.tdc_gfx)
-            _add_fallback_leaf("TDC SOC", "TDC_SOC", "A", vb.tdc_soc)
-            _add_fallback_leaf("Temp Edge", "Temp_Edge", "°C", vb.temp_edge or 100)
-            _add_fallback_leaf("Temp Hotspot", "Temp_Hotspot", "°C", vb.temp_hotspot or 110)
-            _add_fallback_leaf("Temp Mem", "Temp_Mem", "°C", vb.temp_mem or 100)
-            _add_fallback_leaf("Temp VR GFX", "Temp_VR_GFX", "°C", vb.temp_vr_gfx or 115)
-            _add_fallback_leaf("Temp VR SOC", "Temp_VR_SOC", "°C", vb.temp_vr_soc or 115)
+            _add_fallback_leaf("Game Clock", "GameClockAc", vb.gameclock_ac)
+            _add_fallback_leaf("Boost Clock", "BoostClockAc", vb.boostclock_ac)
+            _add_fallback_leaf("PPT AC", "PPT0_AC", vb.power_ac)
+            _add_fallback_leaf("PPT DC", "PPT0_DC", vb.power_dc)
+            _add_fallback_leaf("TDC GFX", "TDC_GFX", vb.tdc_gfx)
+            _add_fallback_leaf("TDC SOC", "TDC_SOC", vb.tdc_soc)
+            _add_fallback_leaf("Temp Edge", "Temp_Edge", vb.temp_edge or 100)
+            _add_fallback_leaf("Temp Hotspot", "Temp_Hotspot", vb.temp_hotspot or 110)
+            _add_fallback_leaf("Temp Mem", "Temp_Mem", vb.temp_mem or 100)
+            _add_fallback_leaf("Temp VR GFX", "Temp_VR_GFX", vb.temp_vr_gfx or 115)
+            _add_fallback_leaf("Temp VR SOC", "Temp_VR_SOC", vb.temp_vr_soc or 115)
 
         pp_layout = QVBoxLayout(pp_grp)
         pp_layout.addWidget(pp_tree)
-        pp_btn_row = QHBoxLayout()
-        self.pp_refresh_btn = QPushButton("Refresh")
-        self.pp_refresh_btn.setToolTip("Read live values from RAM and SMU")
-        self.pp_refresh_btn.setEnabled(True)
-        pp_btn_row.addWidget(self.pp_refresh_btn)
-        self.clocks_apply_btn = QPushButton("Apply PP")
-        self.clocks_apply_btn.setToolTip("Patches all PP table fields in driver RAM (no SMU commands)")
-        pp_btn_row.addWidget(self.clocks_apply_btn)
-        self.pp_save_dump_btn = QPushButton("Save Dump")
-        self.pp_save_dump_btn.setToolTip("Save live PP table from RAM to a .bin file")
-        self.pp_save_dump_btn.setEnabled(False)
-        self.pp_save_dump_btn.clicked.connect(self._on_save_dump)
-        pp_btn_row.addWidget(self.pp_save_dump_btn)
-        pp_layout.addLayout(pp_btn_row)
 
         pp_scroll = QScrollArea()
         pp_scroll.setWidgetResizable(True)
         pp_scroll.setWidget(pp_grp)
-        pp_tab_layout.addWidget(pp_scroll)
+        left_col.addWidget(pp_scroll)
+
+        body.addLayout(left_col, stretch=1)
+
+        # -- Right column: dump list + buttons --
+        right_col = QVBoxLayout()
+
+        self._dump_list = QListWidget()
+        self._dump_list.setMaximumWidth(200)
+        right_col.addWidget(self._dump_list, stretch=1)
+
+        self._load_dump_btn = QPushButton("Load Dump")
+        self._load_dump_btn.setToolTip("Load a saved PP dump into spinboxes (does not apply)")
+        self._load_dump_btn.clicked.connect(self._on_load_dump)
+        right_col.addWidget(self._load_dump_btn)
+
+        self.pp_refresh_btn = QPushButton("Refresh")
+        self.pp_refresh_btn.setToolTip("Read live values from RAM and SMU")
+        self.pp_refresh_btn.setEnabled(True)
+        right_col.addWidget(self.pp_refresh_btn)
+
+        self.clocks_apply_btn = QPushButton("Apply PP")
+        self.clocks_apply_btn.setToolTip("Patches all PP table fields in driver RAM (no SMU commands)")
+        right_col.addWidget(self.clocks_apply_btn)
+
+        self.pp_save_dump_btn = QPushButton("Save Dump")
+        self.pp_save_dump_btn.setToolTip("Save live PP table from RAM to a .bin file")
+        self.pp_save_dump_btn.setEnabled(False)
+        self.pp_save_dump_btn.clicked.connect(self._on_save_dump)
+        right_col.addWidget(self.pp_save_dump_btn)
+
+        body.addLayout(right_col)
+
+        pp_tab_layout.addLayout(body)
 
         # Zero the inner fingerprint region in pp_bytes so physical memory
         # scans don't match our own heap copy of the decoded PP table.
