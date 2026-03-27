@@ -103,6 +103,7 @@ class PPTab(QWidget):
         _SKIP_PAT = re.compile(
             r'^(Padding|Spare|Reserve|MmHubPadding|PADDING_)', re.IGNORECASE,
         )
+
         def _infer_group(path):
             if "DriverReportedClocks/" in path:
                 return "clocks"
@@ -141,19 +142,17 @@ class PPTab(QWidget):
             _QSPIN_MAX = (1 << 31) - 1
             raw_offset = int(leaf.get("offset", -1))
             field_type = str(leaf.get("type", "H"))
-            unit = _infer_unit(name)
             group = _infer_group(full_path)
-            suffix = f" {unit}" if unit else ""
 
             if field_type == "f":
                 vb_val = float(leaf.get("value", 0.0))
-                widget = make_float_spinbox(vb_val, suffix)
+                widget = make_float_spinbox(vb_val)
                 vb_display = f"{vb_val:.6g}"
             elif field_type in ("I", "L"):
                 vb_val = int(leaf.get("value", 0))
                 vb_val = max(0, min(vb_val, 0xFFFFFFFF))
                 widget = make_float_spinbox(
-                    float(vb_val), suffix,
+                    float(vb_val),
                     decimals=0, minimum=0, maximum=4294967295.0, step=1.0,
                 )
                 vb_display = str(vb_val)
@@ -174,7 +173,7 @@ class PPTab(QWidget):
                 else:
                     min_val, max_val = 0, _QSPIN_MAX
                 vb_val = max(min_val, min(vb_val, max_val))
-                widget = make_spinbox(min_val, max_val, vb_val, suffix)
+                widget = make_spinbox(min_val, max_val, vb_val)
                 vb_display = str(vb_val)
 
             item = QTreeWidgetItem(parent_item, [name, vb_display])
@@ -184,7 +183,7 @@ class PPTab(QWidget):
 
             self._item_to_path[item] = full_path
             self.param_current_value_widget[full_path] = cv_label
-            self.param_unit[full_path] = suffix
+            self.param_unit[full_path] = ""
             self.param_widgets[full_path] = widget
             self.pp_patch_keys.add(full_path)
             if raw_offset >= 0:
