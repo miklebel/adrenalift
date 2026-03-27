@@ -97,6 +97,8 @@ class VbiosValues:
     temp_vr_gfx:  int = 0
     temp_vr_soc:  int = 0
 
+    golden_pp_id: int = 0
+
     rom_offset: int = 0
     rom_path:   str = ""
 
@@ -301,6 +303,8 @@ def _parse_vbios_upp_bytes(
                     f"  Fingerprint (inner): {len(pp_inner_fp)} bytes at "
                     f"PP+0x{pwr_off:X}, DMA+0x{inner_fp_dma_off:X}")
 
+        golden_id = int(gp_info["value"]) if gp_info else 0
+
         return VbiosValues(
             baseclock_ac=base or 0,
             gameclock_ac=game or 0,
@@ -318,6 +322,7 @@ def _parse_vbios_upp_bytes(
             temp_mem=temp_mem or 0,
             temp_vr_gfx=temp_vr_gfx or 0,
             temp_vr_soc=temp_vr_soc or 0,
+            golden_pp_id=golden_id,
             rom_offset=pp_offset,
             rom_path=rom_path,
             pp_fingerprint=pp_fp,
@@ -400,6 +405,26 @@ def decode_pp_table_full_from_file(
     except OSError:
         return None
     return decode_pp_table_full(rom_bytes, rom_path)
+
+
+def decode_pp_table_raw(pp_bytes: bytes) -> Optional[DecodedPPTable]:
+    """Decode raw PP table bytes directly (not embedded in a VBIOS ROM)."""
+    if not _UPP_AVAILABLE:
+        return None
+    pp_tbl = bytearray(pp_bytes)
+    try:
+        data = _upp_decode.select_pp_struct(pp_tbl, rawdump=False, debug=False)
+    except Exception:
+        return None
+    if data is None:
+        return None
+    return DecodedPPTable(
+        data=data,
+        pp_offset=0,
+        pp_length=len(pp_tbl),
+        pp_bytes=pp_tbl,
+        rom_path="",
+    )
 
 
 # ---------------------------------------------------------------------------

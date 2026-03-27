@@ -615,6 +615,7 @@ class MainOverclockWidget(QWidget):
     def _set_apply_buttons_enabled(self, enabled: bool):
         self.simple_tab.set_apply_enabled(enabled)
         self.pp_tab.clocks_apply_btn.setEnabled(enabled)
+        self.pp_tab.pp_save_dump_btn.setEnabled(enabled)
         self.od_tab.od_apply_btn.setEnabled(enabled)
 
     def _run_with_hardware(self, action_name: str, apply_fn, require_scan=True):
@@ -643,6 +644,8 @@ class MainOverclockWidget(QWidget):
             self.scan_status_label.setText(f"{action_name} failed.")
         else:
             self._log(f"{action_name} done.")
+            if action_name == "Save Dump":
+                self.pp_tab._refresh_dump_list()
             addrs = getattr(self.scan_result, "valid_addrs", []) or []
             od = getattr(self.scan_result, "od_table", None)
             if addrs:

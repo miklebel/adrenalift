@@ -36,6 +36,7 @@ _LEGACY_DMA_CACHE_PATH = os.path.join(_SETTINGS_DIR, ".dma_offset_cache.json")
 
 _DEFAULTS = {
     "dma_cache": {},
+    "pptable_cache": {},
     "defaults": {
         "simple_clock_mhz": 3500,
         "scan_workers": None,

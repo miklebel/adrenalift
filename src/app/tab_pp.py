@@ -7,13 +7,18 @@ Full decoded PP tree view with per-field Set buttons.
 
 from __future__ import annotations
 
+import os
 import re
 
 from PySide6.QtWidgets import (
+    QDialog,
+    QDialogButtonBox,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
+    QListWidget,
     QPushButton,
     QScrollArea,
     QTreeWidget,
@@ -22,15 +27,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.app.constants import DEFAULT_VBIOS_PATH
+from src.app.constants import DEFAULT_VBIOS_PATH, PP_DUMPS_DIR
 from src.app.help_texts import PP_HELP_HTML
 from src.app.ui_helpers import make_spinbox, make_set_button, make_cheatsheet_button
 from src.io.vbios_parser import (
     VbiosValues,
     decode_pp_table_full,
+    decode_pp_table_raw,
 )
 from src.io.vbios_storage import read_vbios_decoded
-from src.engine.overclock_engine import patch_pp_single_field
+from src.engine.overclock_engine import patch_pp_single_field, read_raw_at_addr
 
 
 class PPTab(QWidget):
@@ -51,6 +57,7 @@ class PPTab(QWidget):
         self.param_unit: dict[str, str] = {}
         self.pp_ram_offset_map: dict[str, dict] = {}
         self.pp_patch_keys: set[str] = set()
+        self._item_to_path: dict[QTreeWidgetItem, str] = {}
 
         self._build_ui()
 
@@ -58,12 +65,38 @@ class PPTab(QWidget):
         vb = self.vbios_values
         pp_tab_layout = QVBoxLayout(self)
 
+        # -- Top area: cheatsheet + search (left) | dump list (right) --
+        top_area = QHBoxLayout()
+
+        left_col = QVBoxLayout()
         _, pp_hint_row = make_cheatsheet_button(
             self, "PP", PP_HELP_HTML, self._show_cheatsheet,
             tooltip="How PP Table RAM patching works",
             label="PP \u2014 PowerPlay Table",
         )
-        pp_tab_layout.addLayout(pp_hint_row)
+        left_col.addLayout(pp_hint_row)
+
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Search PP fields\u2026")
+        self._search_edit.setClearButtonEnabled(True)
+        self._search_edit.textChanged.connect(self._on_search_changed)
+        left_col.addWidget(self._search_edit)
+        left_col.addStretch()
+        top_area.addLayout(left_col, stretch=1)
+
+        right_col = QVBoxLayout()
+        self._dump_list = QListWidget()
+        self._dump_list.setMaximumWidth(180)
+        self._dump_list.setMaximumHeight(100)
+        right_col.addWidget(self._dump_list)
+        self._load_dump_btn = QPushButton("Load Dump")
+        self._load_dump_btn.setMaximumWidth(180)
+        self._load_dump_btn.setToolTip("Load a saved PP dump into spinboxes (does not apply)")
+        self._load_dump_btn.clicked.connect(self._on_load_dump)
+        right_col.addWidget(self._load_dump_btn)
+        top_area.addLayout(right_col)
+
+        pp_tab_layout.addLayout(top_area)
 
         pp_grp = QGroupBox("PP — PowerPlay Table")
         pp_tree = QTreeWidget()
@@ -167,6 +200,7 @@ class PPTab(QWidget):
             pp_tree.setItemWidget(item, 2, cv_label)
             pp_tree.setItemWidget(item, 3, widget)
 
+            self._item_to_path[item] = full_path
             self.param_current_value_widget[full_path] = cv_label
             self.param_unit[full_path] = f" {unit}" if unit else ""
             self.param_widgets[full_path] = widget
@@ -261,6 +295,11 @@ class PPTab(QWidget):
         self.clocks_apply_btn = QPushButton("Apply PP")
         self.clocks_apply_btn.setToolTip("Patches all PP table fields in driver RAM (no SMU commands)")
         pp_btn_row.addWidget(self.clocks_apply_btn)
+        self.pp_save_dump_btn = QPushButton("Save Dump")
+        self.pp_save_dump_btn.setToolTip("Save live PP table from RAM to a .bin file")
+        self.pp_save_dump_btn.setEnabled(False)
+        self.pp_save_dump_btn.clicked.connect(self._on_save_dump)
+        pp_btn_row.addWidget(self.pp_save_dump_btn)
         pp_layout.addLayout(pp_btn_row)
 
         pp_scroll = QScrollArea()
@@ -278,6 +317,163 @@ class PPTab(QWidget):
                 _fp_end = _fp_start + 16
                 if 0 <= _fp_start < _fp_end <= len(decoded.pp_bytes):
                     decoded.pp_bytes[_fp_start:_fp_end] = b'\x00' * 16
+
+        self._refresh_dump_list()
+
+    # ------------------------------------------------------------------
+
+    def _on_search_changed(self, text: str):
+        text = text.strip().lower()
+
+        def _set_visibility(item):
+            child_count = item.childCount()
+            if child_count == 0:
+                if not text:
+                    item.setHidden(False)
+                    return True
+                path = self._item_to_path.get(item, "")
+                vbios_val = item.text(1)
+                visible = text in path.lower() or text in vbios_val.lower()
+                item.setHidden(not visible)
+                return visible
+            any_visible = False
+            for i in range(child_count):
+                if _set_visibility(item.child(i)):
+                    any_visible = True
+            if not text:
+                item.setHidden(False)
+                return True
+            item.setHidden(not any_visible)
+            return any_visible
+
+        root = self._pp_tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            _set_visibility(root.child(i))
+
+    # ------------------------------------------------------------------
+
+    def _refresh_dump_list(self):
+        self._dump_list.clear()
+        if not os.path.isdir(PP_DUMPS_DIR):
+            return
+        bins = sorted(f for f in os.listdir(PP_DUMPS_DIR) if f.endswith(".bin"))
+        for name in bins:
+            self._dump_list.addItem(name)
+
+    # ------------------------------------------------------------------
+
+    def _on_save_dump(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Save PP Dump")
+        dlg_layout = QVBoxLayout(dlg)
+        dlg_layout.addWidget(QLabel("Dump name:"))
+        name_edit = QLineEdit()
+        name_edit.setPlaceholderText("e.g. stock_1800mhz")
+        dlg_layout.addWidget(name_edit)
+        btn_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+        )
+        btn_box.accepted.connect(dlg.accept)
+        btn_box.rejected.connect(dlg.reject)
+        dlg_layout.addWidget(btn_box)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        name = name_edit.text().strip()
+        if not name:
+            self._log("Save Dump: empty name, cancelled.")
+            return
+
+        _INVALID = set('\\/:*?"<>|')
+        if any(c in _INVALID for c in name):
+            self._log(f"Save Dump: invalid characters in name '{name}'")
+            return
+
+        if self._decoded is None or not self._decoded.pp_bytes:
+            self._log("Save Dump: no decoded PP table available.")
+            return
+
+        pp_size = len(self._decoded.pp_bytes)
+        dest_path = os.path.join(PP_DUMPS_DIR, f"{name}.bin")
+
+        def do_save(hw):
+            scan_result = self._get_scan_result()
+            if not scan_result or not scan_result.valid_addrs:
+                return (False, "No valid scan addresses — run Scan first")
+            bc_off = getattr(self.vbios_values, 'baseclock_pp_offset', 0)
+            pp_start = scan_result.valid_addrs[0] - bc_off
+            raw = read_raw_at_addr(hw["inpout"], pp_start, pp_size)
+            if raw is None:
+                return (False, "Failed to read PP table from RAM")
+            os.makedirs(PP_DUMPS_DIR, exist_ok=True)
+            with open(dest_path, "wb") as f:
+                f.write(raw)
+            self._log(f"Save Dump: wrote {len(raw)} bytes to {dest_path}")
+
+        self._run_with_hardware("Save Dump", do_save)
+
+    # ------------------------------------------------------------------
+
+    def _on_load_dump(self):
+        item = self._dump_list.currentItem()
+        if item is None:
+            self._log("Load Dump: no dump selected.")
+            return
+        filename = item.text()
+        path = os.path.join(PP_DUMPS_DIR, filename)
+        try:
+            with open(path, "rb") as f:
+                dump_bytes = f.read()
+        except OSError as e:
+            self._log(f"Load Dump: failed to read {path}: {e}")
+            return
+
+        decoded = decode_pp_table_raw(dump_bytes)
+        if decoded is None:
+            self._log("Load Dump: failed to decode dump file.")
+            return
+
+        updated = 0
+
+        def _walk_and_update(node, path_prefix):
+            nonlocal updated
+            if not isinstance(node, dict):
+                return
+            if "entries" in node and isinstance(node["entries"], list):
+                for idx, child in enumerate(node["entries"]):
+                    child_path = f"{path_prefix}/{idx}" if path_prefix else str(idx)
+                    if isinstance(child, dict) and "value" in child and "offset" in child:
+                        widget = self.param_widgets.get(child_path)
+                        if widget and hasattr(widget, "setValue"):
+                            widget.setValue(int(child["value"]))
+                            updated += 1
+                    else:
+                        _walk_and_update(child, child_path)
+                return
+            for key, child in node.items():
+                child_path = f"{path_prefix}/{key}" if path_prefix else str(key)
+                if isinstance(child, dict):
+                    if "value" in child and "offset" in child:
+                        widget = self.param_widgets.get(child_path)
+                        if widget and hasattr(widget, "setValue"):
+                            widget.setValue(int(child["value"]))
+                            updated += 1
+                    else:
+                        _walk_and_update(child, child_path)
+                elif isinstance(child, list):
+                    for idx, elem in enumerate(child):
+                        elem_path = f"{child_path}/{idx}"
+                        if isinstance(elem, dict) and "value" in elem and "offset" in elem:
+                            widget = self.param_widgets.get(elem_path)
+                            if widget and hasattr(widget, "setValue"):
+                                widget.setValue(int(elem["value"]))
+                                updated += 1
+                        elif isinstance(elem, dict):
+                            _walk_and_update(elem, elem_path)
+
+        _walk_and_update(decoded.data, "")
+        self._log(f"Load Dump: updated {updated} spinbox values from {filename}")
 
     # ------------------------------------------------------------------
 

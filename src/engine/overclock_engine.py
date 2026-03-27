@@ -136,6 +136,36 @@ def _save_dma_cache(offset: int, method: str):
 
 
 # ---------------------------------------------------------------------------
+# PP table address cache  (delegates to unified settings.json)
+# ---------------------------------------------------------------------------
+
+
+def _load_pptable_cache():
+    """Load cached PP table address from disk.
+
+    Returns (address, golden_pp_id) or None.
+    """
+    addr = _settings.get("pptable_cache.address")
+    gpid = _settings.get("pptable_cache.golden_pp_id")
+    if isinstance(addr, int) and addr > 0 and isinstance(gpid, int) and gpid > 0:
+        return addr, gpid
+    return None
+
+
+def _save_pptable_cache(address: int, golden_pp_id: int):
+    """Persist the discovered PP table physical address to disk."""
+    try:
+        _settings.set("pptable_cache", {
+            "address": address,
+            "golden_pp_id": golden_pp_id,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        })
+        _elog(f"_save_pptable_cache: wrote address=0x{address:X} golden_pp_id={golden_pp_id}")
+    except Exception as e:
+        _elog(f"_save_pptable_cache: failed: {e}")
+
+
+# ---------------------------------------------------------------------------
 # In-memory DMA offset cache (shared across threads within one process)
 # ---------------------------------------------------------------------------
 
@@ -3039,6 +3069,55 @@ def scan_for_pptable(inpout, settings, scan_opts=None, progress_callback=None,
         cb(20, f"Search pattern (patched):  {patched_clock_pattern.hex(' ').upper()}")
 
     # ------------------------------------------------------------------
+    # CACHED-ADDRESS fast path: trusted when golden_pp_id matches.
+    # The address was already validated during the scan that cached it;
+    # a matching golden_pp_id means same GPU / same VBIOS, so the
+    # physical address hasn't moved.
+    # ------------------------------------------------------------------
+    _pptable_cached = _load_pptable_cache()
+    if (_pptable_cached is not None
+            and vbios_values is not None
+            and vbios_values.golden_pp_id
+            and vbios_values.golden_pp_id == _pptable_cached[1]):
+        cached_addr, _cached_gpid = _pptable_cached
+        cb(5, f"PP table cache hit: 0x{cached_addr:012X} (golden_pp_id={_cached_gpid})")
+
+        page_base = cached_addr & ~0xFFF
+        page_off = cached_addr - page_base
+        v, h = inpout.map_phys(page_base, 4096)
+        game_val = ctypes.c_ushort.from_address(v + page_off + 2).value
+        boost_val = ctypes.c_ushort.from_address(v + page_off + 4).value
+        inpout.unmap_phys(v, h)
+
+        target_game = settings._game_clock()
+        target_boost = settings._boost_clock()
+        orig_game = vbios_values.gameclock_ac
+        is_patched = (game_val == target_game and boost_val == target_boost
+                      and game_val != orig_game)
+
+        cb(100, f"PP table cache valid — returning 0x{cached_addr:012X}")
+        _elog(f"pptable_cache: hit at 0x{cached_addr:X}")
+        return ScanResult(
+            valid_addrs=[cached_addr],
+            already_patched_addrs=[cached_addr] if is_patched else [],
+            rejected_addrs=[],
+            all_clock_addrs=[cached_addr],
+            did_full_scan=False,
+            match_details=[{
+                'addr': cached_addr, 'valid': True,
+                'already_patched': is_patched,
+                'game_clock': game_val, 'boost_clock': boost_val,
+                'msglimits': {}, 'reject_reasons': [],
+            }],
+            fingerprint_validated=True,
+        )
+    elif _pptable_cached is not None:
+        cb(8, "PP table cache: golden_pp_id mismatch — ignoring cache")
+        _elog(f"pptable_cache: golden_pp_id mismatch "
+              f"(cached={_pptable_cached[1]}, "
+              f"vbios={getattr(vbios_values, 'golden_pp_id', 0)})")
+
+    # ------------------------------------------------------------------
     # FAST PATH: offset-targeted scan at the known PPTable page offset.
     # Always tried first when a fingerprint is available.  Falls back to
     # the full byte-search scan only when no valid match is found.
@@ -3115,6 +3194,10 @@ def scan_for_pptable(inpout, settings, scan_opts=None, progress_callback=None,
                 })
 
             if valid_addrs:
+                if (vbios_values is not None
+                        and vbios_values.golden_pp_id):
+                    _save_pptable_cache(valid_addrs[0],
+                                        vbios_values.golden_pp_id)
                 cb(100, f"Offset scan: {len(valid_addrs)} valid PPTable(s) "
                    f"at offset 0x{_PPTABLE_PAGE_OFFSET:03X}")
                 return ScanResult(

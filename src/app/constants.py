@@ -115,6 +115,7 @@ _METRICS_DISPLAY_SECTIONS = [
 # ---------------------------------------------------------------------------
 
 DEFAULT_VBIOS_PATH = os.path.join(_script_dir, "bios", "vbios.rom")
+PP_DUMPS_DIR = os.path.join(_script_dir, "pp_dumps")
 
 
 def _get_vbios_values(path: str = DEFAULT_VBIOS_PATH):
