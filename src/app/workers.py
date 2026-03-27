@@ -31,6 +31,8 @@ from src.engine.overclock_engine import (
     read_smu_metrics_full,
     read_smu_table_raw,
     read_f32,
+    read_i16,
+    read_i32,
     read_u8,
     read_u16,
     read_u32,
@@ -323,8 +325,8 @@ class DetailedRefreshWorker(QThread):
                     base = self.valid_addrs[0]
                     _type_reader = {
                         "B": read_u8, "b": read_u8,
-                        "H": read_u16, "h": read_u16,
-                        "I": read_u32, "L": read_u32, "i": read_u32, "l": read_u32,
+                        "H": read_u16, "h": read_i16,
+                        "I": read_u32, "L": read_u32, "i": read_i32, "l": read_i32,
                         "f": read_f32,
                     }
                     for key, meta in self.pp_ram_offset_map.items():

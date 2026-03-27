@@ -141,27 +141,40 @@ class PPTab(QWidget):
             _QSPIN_MAX = (1 << 31) - 1
             raw_offset = int(leaf.get("offset", -1))
             field_type = str(leaf.get("type", "H"))
+            unit = _infer_unit(name)
             group = _infer_group(full_path)
+            suffix = f" {unit}" if unit else ""
 
-            is_float = (field_type == "f")
-            if is_float:
+            if field_type == "f":
                 vb_val = float(leaf.get("value", 0.0))
-                widget = make_float_spinbox(vb_val, "")
+                widget = make_float_spinbox(vb_val, suffix)
                 vb_display = f"{vb_val:.6g}"
+            elif field_type in ("I", "L"):
+                vb_val = int(leaf.get("value", 0))
+                vb_val = max(0, min(vb_val, 0xFFFFFFFF))
+                widget = make_float_spinbox(
+                    float(vb_val), suffix,
+                    decimals=0, minimum=0, maximum=4294967295.0, step=1.0,
+                )
+                vb_display = str(vb_val)
             else:
                 vb_val = int(leaf.get("value", 0))
-                if field_type in ("Q", "q"):
-                    max_val = _QSPIN_MAX
-                elif field_type in ("I", "L", "i", "l"):
-                    max_val = min(2_000_000_000, _QSPIN_MAX)
-                elif field_type in ("B", "b"):
-                    max_val = 255
-                elif field_type in ("H", "h"):
-                    max_val = 65535
+                if field_type == "h":
+                    min_val, max_val = -32768, 32767
+                elif field_type == "b":
+                    min_val, max_val = -128, 127
+                elif field_type in ("i", "l"):
+                    min_val, max_val = -_QSPIN_MAX, _QSPIN_MAX
+                elif field_type in ("B",):
+                    min_val, max_val = 0, 255
+                elif field_type in ("H",):
+                    min_val, max_val = 0, 65535
+                elif field_type in ("Q", "q"):
+                    min_val, max_val = 0, _QSPIN_MAX
                 else:
-                    max_val = _QSPIN_MAX
-                vb_val = max(0, min(vb_val, max_val))
-                widget = make_spinbox(0, max_val, vb_val, "")
+                    min_val, max_val = 0, _QSPIN_MAX
+                vb_val = max(min_val, min(vb_val, max_val))
+                widget = make_spinbox(min_val, max_val, vb_val, suffix)
                 vb_display = str(vb_val)
 
             item = QTreeWidgetItem(parent_item, [name, vb_display])
@@ -171,7 +184,7 @@ class PPTab(QWidget):
 
             self._item_to_path[item] = full_path
             self.param_current_value_widget[full_path] = cv_label
-            self.param_unit[full_path] = ""
+            self.param_unit[full_path] = suffix
             self.param_widgets[full_path] = widget
             self.pp_patch_keys.add(full_path)
             if raw_offset >= 0:

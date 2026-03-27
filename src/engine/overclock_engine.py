@@ -1098,6 +1098,31 @@ def read_u32(inpout, phys_addr, offset):
         inpout.unmap_phys(virt, handle)
 
 
+def read_i16(inpout, phys_addr, offset):
+    """Read a signed int16 at physical address + offset."""
+    addr = phys_addr + offset
+    page_base = addr & ~0xFFF
+    page_off = addr - page_base
+    virt, handle = inpout.map_phys(page_base, 4096)
+    try:
+        return ctypes.c_short.from_address(virt + page_off).value
+    finally:
+        inpout.unmap_phys(virt, handle)
+
+
+def read_i32(inpout, phys_addr, offset):
+    """Read a signed int32 at physical address + offset."""
+    addr = phys_addr + offset
+    page_base = addr & ~0xFFF
+    page_off = addr - page_base
+    map_size = 8192 if page_off + 4 > 4096 else 4096
+    virt, handle = inpout.map_phys(page_base, map_size)
+    try:
+        return ctypes.c_int.from_address(virt + page_off).value
+    finally:
+        inpout.unmap_phys(virt, handle)
+
+
 def read_f32(inpout, phys_addr, offset):
     """Read 4 bytes at physical address + offset, return as IEEE 754 float."""
     raw_u32 = read_u32(inpout, phys_addr, offset)
@@ -3879,19 +3904,20 @@ def _apply_pp_field_groups(inpout, scan_result, field_values, field_offset_map, 
             if off is None:
                 continue
             try:
+                mask = _VERIFY_MASK.get(typ, 0xFFFF)
                 if typ == "f":
                     int_val = struct.unpack('<I', struct.pack('<f', float(value)))[0]
                     _, verify = patch_u32(inpout, addr, int(off), int_val)
-                    ok = (int(verify) == int_val)
+                    ok = (int(verify) & mask == int_val & mask)
                 elif typ in ("B", "b"):
                     _, verify = patch_u8(inpout, addr, int(off), int(value))
-                    ok = (int(verify) == int(value))
+                    ok = (int(verify) & mask == int(value) & mask)
                 elif typ in ("I", "L", "i", "l"):
                     _, verify = patch_u32(inpout, addr, int(off), int(value))
-                    ok = (int(verify) == int(value))
+                    ok = (int(verify) & mask == int(value) & mask)
                 else:
                     _, verify = patch_u16(inpout, addr, int(off), int(value))
-                    ok = (int(verify) == int(value))
+                    ok = (int(verify) & mask == int(value) & mask)
                 if ok:
                     writes_this_addr += 1
                     results['field_writes'] += 1
@@ -3904,6 +3930,11 @@ def _apply_pp_field_groups(inpout, scan_result, field_values, field_offset_map, 
         else:
             results['skipped_count'] += 1
     return results
+
+
+_VERIFY_MASK = {"B": 0xFF, "b": 0xFF, "H": 0xFFFF, "h": 0xFFFF,
+                "I": 0xFFFFFFFF, "L": 0xFFFFFFFF, "i": 0xFFFFFFFF,
+                "l": 0xFFFFFFFF, "f": 0xFFFFFFFF}
 
 
 def patch_pp_single_field(inpout, scan_result, offset, value, type_code="H"):
@@ -3921,6 +3952,7 @@ def patch_pp_single_field(inpout, scan_result, offset, value, type_code="H"):
         val = struct.unpack('<I', struct.pack('<f', float(value)))[0]
     else:
         val = int(value)
+    mask = _VERIFY_MASK.get(typ, 0xFFFF)
     for addr in scan_result.valid_addrs:
         try:
             if typ in ("B", "b"):
@@ -3929,7 +3961,7 @@ def patch_pp_single_field(inpout, scan_result, offset, value, type_code="H"):
                 _, verify = patch_u32(inpout, addr, off, val)
             else:
                 _, verify = patch_u16(inpout, addr, off, val)
-            if int(verify) == val:
+            if int(verify) & mask == val & mask:
                 result["writes"] += 1
         except Exception:
             continue

@@ -45,12 +45,21 @@ def make_spinbox(
 def make_float_spinbox(
     value: float = 0.0,
     suffix: str = "",
+    *,
+    decimals: int = 9,
+    minimum: float = -3.4e38,
+    maximum: float = 3.4e38,
+    step: float = 0.001,
 ) -> QDoubleSpinBox:
-    """Create a QDoubleSpinBox for IEEE 754 float PP table fields."""
+    """Create a QDoubleSpinBox for float or large-integer PP table fields.
+
+    *decimals=9* guarantees lossless IEEE 754 float32 round-trips.
+    For unsigned-u32 fields, use ``decimals=0, minimum=0, maximum=4294967295``.
+    """
     w = QDoubleSpinBox()
-    w.setDecimals(6)
-    w.setRange(-3.4e38, 3.4e38)
-    w.setSingleStep(0.001)
+    w.setDecimals(decimals)
+    w.setRange(minimum, maximum)
+    w.setSingleStep(step)
     w.setValue(value)
     if suffix:
         w.setSuffix(suffix)
