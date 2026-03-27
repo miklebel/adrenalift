@@ -31,7 +31,7 @@ from src.app.constants import APP_VERSION, APP_BUILD, DEFAULT_VBIOS_PATH, _get_v
 from src.app.logging_setup import _log_to_file
 from src.app.settings import settings
 from src.app.startup_task import ensure_startup_points_to_current
-from src.app.ui_helpers import make_spinbox
+from src.app.ui_helpers import fmt_f32, make_spinbox
 
 from src.app.tab_simple import SimpleTab
 from src.app.tab_pp import PPTab
@@ -437,7 +437,7 @@ class MainOverclockWidget(QWidget):
         def _fmt(val, suffix=""):
             if val is not None:
                 if isinstance(val, float):
-                    return f"{val:.6g}{suffix}"
+                    return f"{fmt_f32(val)}{suffix}"
                 return f"{val}{suffix}"
             return "—"
         updated = 0

@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 
 from src.app.constants import DEFAULT_VBIOS_PATH, PP_DUMPS_DIR
 from src.app.help_texts import PP_HELP_HTML
-from src.app.ui_helpers import make_spinbox, make_float_spinbox, make_set_button, make_cheatsheet_button
+from src.app.ui_helpers import fmt_f32, make_spinbox, make_float_spinbox, make_set_button, make_cheatsheet_button
 from src.io.vbios_parser import (
     VbiosValues,
     decode_pp_table_full,
@@ -147,13 +147,14 @@ class PPTab(QWidget):
             if field_type == "f":
                 vb_val = float(leaf.get("value", 0.0))
                 widget = make_float_spinbox(vb_val)
-                vb_display = f"{vb_val:.6g}"
+                vb_display = fmt_f32(vb_val)
             elif field_type in ("I", "L"):
                 vb_val = int(leaf.get("value", 0))
                 vb_val = max(0, min(vb_val, 0xFFFFFFFF))
                 widget = make_float_spinbox(
                     float(vb_val),
                     decimals=0, minimum=0, maximum=4294967295.0, step=1.0,
+                    use_f32_format=False,
                 )
                 vb_display = str(vb_val)
             else:

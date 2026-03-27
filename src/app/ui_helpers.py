@@ -6,6 +6,8 @@ factory functions, reducing boilerplate across tabs.
 
 from __future__ import annotations
 
+import struct
+
 from PySide6.QtCore import Qt, QSize
 from PySide6.QtWidgets import (
     QDoubleSpinBox,
@@ -18,6 +20,41 @@ from PySide6.QtWidgets import (
     QToolButton,
     QWidget,
 )
+
+
+def fmt_f32(val: float) -> str:
+    """Shortest ``:.Ng`` representation that round-trips through IEEE 754 float32.
+
+    Tries N = 6..9 significant digits and returns the first format whose
+    ``float()`` parse re-packs to the same 4-byte pattern.  Falls back to
+    ``:.9g`` which is always sufficient per IEEE 754.
+    """
+    orig = struct.pack("<f", val)
+    for n in range(6, 10):
+        s = f"{val:.{n}g}"
+        if struct.pack("<f", float(s)) == orig:
+            return s
+    return f"{val:.9g}"
+
+
+class Float32SpinBox(QDoubleSpinBox):
+    """QDoubleSpinBox that displays values using :func:`fmt_f32`.
+
+    Internally keeps ``decimals=9`` for full float32 precision, but
+    ``textFromValue`` trims trailing noise so the user sees clean numbers
+    (e.g. ``1.45`` instead of ``1.450000048``).
+    """
+
+    def textFromValue(self, value: float) -> str:  # noqa: N802
+        txt = fmt_f32(value)
+        sfx = self.suffix()
+        return f"{txt}{sfx}" if sfx else txt
+
+    def valueFromText(self, text: str) -> float:  # noqa: N802
+        sfx = self.suffix()
+        if sfx and text.endswith(sfx):
+            text = text[: -len(sfx)]
+        return float(text)
 
 
 def make_spinbox(
@@ -50,13 +87,17 @@ def make_float_spinbox(
     minimum: float = -3.4e38,
     maximum: float = 3.4e38,
     step: float = 0.001,
+    use_f32_format: bool = True,
 ) -> QDoubleSpinBox:
     """Create a QDoubleSpinBox for float or large-integer PP table fields.
 
     *decimals=9* guarantees lossless IEEE 754 float32 round-trips.
     For unsigned-u32 fields, use ``decimals=0, minimum=0, maximum=4294967295``.
+
+    When *use_f32_format* is True (default for float fields), returns a
+    :class:`Float32SpinBox` that formats display with :func:`fmt_f32`.
     """
-    w = QDoubleSpinBox()
+    w = Float32SpinBox() if use_f32_format else QDoubleSpinBox()
     w.setDecimals(decimals)
     w.setRange(minimum, maximum)
     w.setSingleStep(step)
