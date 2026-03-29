@@ -96,7 +96,9 @@ adrenalift/
    - `inpoutx64.dll`
    - `WinRing0x64.dll`
    - `WinRing0x64.sys`
-   - `WinRing0x64_patched.sys` (optional)
+   - `WinRing0x64_patched.sys` (optional — removes the 1 MB physical memory restriction)
+
+   See **[DRIVERS.md](DRIVERS.md)** for details on each driver, what the patched version changes, and how to independently verify the patch with `python tools/verify_patch.py`.
 
 4. **Build:**
 
