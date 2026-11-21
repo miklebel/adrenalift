@@ -20,7 +20,7 @@ Adrenalift gives you precise, real-time control over your GPU — clocks, voltag
 - An **AMD Radeon RX 9000 series (RDNA 4)** GPU. Adrenalift is built for the RDNA 4 family. RDNA 3 and older are untested and unsupported.
 - A current **AMD Adrenalin** driver installed
 - **Administrator privileges** — Adrenalift asks for them at launch; they are needed to read GPU telemetry and apply settings
-- **[PawnIO](https://pawnio.eu)** for Advanced mode — the installer sets it up when it is missing, and the portable build includes its installer
+- **[PawnIO](https://pawnio.eu)** for Advanced mode — the installer tries to set it up when it is missing, and both builds include PawnIO's own installer in `resources\pawnio`
 
 > Overclocking is done at your own risk. All changes are non-persistent and revert on reboot, so any unstable setting is undone with a simple restart.
 
@@ -66,7 +66,7 @@ Adrenalift runs in one of two modes, switchable any time from the top bar.
 
 **Advanced mode** reaches deeper into the GPU through **[PawnIO](https://pawnio.eu)**, a signed driver built for hardware tools, using the **RadeonSMU** module from the official [PawnIO.Modules](https://github.com/namazso/PawnIO.Modules) collection. This unlocks the **full telemetry set** and the **soft clock limits**, which open up more tuning potential. The module is deliberately narrow: it can reach the GPU's power-management mailbox and read one telemetry buffer, and nothing else on the system. Since 1.0 this replaces the InpOut helper earlier versions used, which exposed unrestricted physical memory access.
 
-PawnIO is still a kernel-level driver, so if an anti-cheat–protected game objects to it, switch back to Safe mode — you can do that at any time. The installer sets PawnIO up when it isn't already on your PC; the portable build ships its installer in `resources\pawnio`.
+PawnIO is still a kernel-level driver, so if an anti-cheat–protected game objects to it, switch back to Safe mode — you can do that at any time. The installer tries to set PawnIO up when it isn't already on your PC. If Advanced mode still reports it missing, run `resources\pawnio\PawnIO_setup.exe` from the Adrenalift folder — the portable build ships it there too.
 
 ### Made yours
 - Four themes — **Dark**, **Dark Warm**, **Light** and **Paper** — plus accent colours
