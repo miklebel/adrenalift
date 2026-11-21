@@ -19,9 +19,12 @@ Adrenalift gives you precise, real-time control over your GPU — clocks, voltag
 - **Windows 11** (64-bit)
 - An **AMD Radeon RX 9000 series (RDNA 4)** GPU. Adrenalift is built for the RDNA 4 family. RDNA 3 and older are untested and unsupported.
 - A current **AMD Adrenalin** driver installed
-- **Administrator privileges** — needed to read GPU telemetry and apply settings
+- **Administrator privileges** — Adrenalift asks for them at launch; they are needed to read GPU telemetry and apply settings
+- **[PawnIO](https://pawnio.eu)** for Advanced mode — the installer sets it up when it is missing, and the portable build includes its installer
 
 > Overclocking is done at your own risk. All changes are non-persistent and revert on reboot, so any unstable setting is undone with a simple restart.
+
+> **Smart App Control:** Adrenalift builds are not code-signed yet. If Windows 11's Smart App Control is switched **on**, Windows will refuse to start the app and there is no per-app exception. SmartScreen, by contrast, only shows a warning you can dismiss. You can see whether Smart App Control is on under *Windows Security → App & browser control*.
 
 ---
 
@@ -61,7 +64,9 @@ Adrenalift runs in one of two modes, switchable any time from the top bar.
 
 **Safe mode** *(default)* talks to your GPU through the AMD driver directly, with **no extra kernel drivers loaded**. It's the most compatible option — it sits happily alongside anti-cheat–protected games and won't be flagged by security software. You still get the core controls: clock offset, undervolt, memory, power limit and cooling. The trade-off is that the **richer telemetry** and the **soft clock floor/ceiling limits** aren't available in this mode.
 
-**Advanced mode** loads a small low-level helper driver (InpOut) to reach deeper into the GPU. This unlocks the **full telemetry set** and the **soft clock limits**, which open up more tuning potential. Because it loads a kernel-level driver, **some antivirus or anti-cheat software may flag or block it** — so it's best to keep Advanced mode off while playing anti-cheat–protected games, and you may need to allow the helper driver in your security software. You can switch back to Safe mode at any time.
+**Advanced mode** reaches deeper into the GPU through **[PawnIO](https://pawnio.eu)**, a signed driver built for hardware tools, using the **RadeonSMU** module from the official [PawnIO.Modules](https://github.com/namazso/PawnIO.Modules) collection. This unlocks the **full telemetry set** and the **soft clock limits**, which open up more tuning potential. The module is deliberately narrow: it can reach the GPU's power-management mailbox and read one telemetry buffer, and nothing else on the system. Since 1.0 this replaces the InpOut helper earlier versions used, which exposed unrestricted physical memory access.
+
+PawnIO is still a kernel-level driver, so if an anti-cheat–protected game objects to it, switch back to Safe mode — you can do that at any time. The installer sets PawnIO up when it isn't already on your PC; the portable build ships its installer in `resources\pawnio`.
 
 ### Made yours
 - Four themes — **Dark**, **Dark Warm**, **Light** and **Paper** — plus accent colours
@@ -76,6 +81,7 @@ Adrenalift stands on the shoulders of the RDNA overclocking community.
 
 - **fpsflow** — for the foundational research on raising RDNA 3 / RDNA 4 desktop-class power, current and voltage limits and adding VID offsets. Adrenalift works best paired with his work. Read his write-up here: [Increasing RDNA3/RDNA4 desktop-class power limits and adding VID offsets](https://www.overclock.net/threads/increasing-rdna3-rdna4-desktop-class-power-limits-and-adding-vid-offsets.1816083).
 - **[nik2234](https://www.overclock.net/members/nik2234.648545/)** — for getting me into RDNA 4 and opening the door to the overclocking community, for being the project's voice of reason, and for serving as its main tester. Adrenalift wouldn't be what it is without him.
+- **[namazso](https://github.com/namazso)** — for [PawnIO](https://pawnio.eu), the signed driver Advanced mode runs on, and for reviewing and signing the RadeonSMU module that made it possible to drop InpOut.
 
 ---
 
